@@ -1,0 +1,35 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  pinned:
+    # Must pass. Mirrors upstream's matrix.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install "vectorbt==1.1.0" -e ".[dev]"
+      - run: pytest -q
+
+  floating:
+    # Informational canary for upstream drift. ALLOWED TO BE RED.
+    # It watches for changes to portfolio/nb.py callback internals (§5.5 item 1) and for
+    # name collisions from patching (item 5). A red canary is information, not an
+    # emergency — read it, do not panic.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --upgrade vectorbt -e ".[dev]"
+      - run: pytest -q

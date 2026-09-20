@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vectorbtX"
+version = "0.1.0"
+description = "A pure wrapper over vectorbt adding instruments, leverage, multi-currency and MT4/MT5 metrics."
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+    "vectorbt==1.1.0",
+    "numpy>=2.4.6",
+    "pandas>=3.0.3,<4.0",
+    "scipy",
+]
+
+[project.optional-dependencies]
+excel = ["openpyxl"]
+rates = ["requests"]
+dev = ["pytest", "pytest-cov"]
+
+[tool.setuptools.packages.find]
+include = ["vectorbtx*"]
+
+# `vectorbtX.py` is a case alias so `import vectorbtX` works on case-sensitive
+# filesystems (Linux). See the module docstring. It must ship as a top-level module.
+[tool.setuptools]
+py-modules = ["vectorbtX"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
