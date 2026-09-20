@@ -66,7 +66,7 @@ parameters, use its callback hooks rather than reaching into the loop.
 ### 1.3 The contract
 
 ```python
-import vectorbtX as vbt
+import vectorbtx as vbt
 ```
 
 must be a **drop-in replacement** for `import vectorbt as vbt`:
@@ -570,7 +570,7 @@ plausible and is wrong.
 
 ```
 1. IMPORT                                                        [Section B]
-   import vectorbtX as vbt
+   import vectorbtx as vbt
    → vectorbt namespace re-exported, Portfolio subclass swapped in
    → ReturnsAccessor and Trades patched with new metrics
    → settings["vectorbtx"] added
@@ -732,7 +732,7 @@ MT4/MT5 metric set is already native.
 
 ### B. Package foundations
 
-**Purpose.** Make `import vectorbtX as vbt` a working drop-in replacement, and establish the patterns
+**Purpose.** Make `import vectorbtx as vbt` a working drop-in replacement, and establish the patterns
 every other section follows.
 
 **Deliverable**
@@ -790,7 +790,7 @@ def _attach(cls, name, fn):
 
 **Done when**
 - An unmodified vectorbt script gives bit-identical results under vectorbtX
-- `import vectorbtX` emits no warnings
+- `import vectorbtx` emits no warnings
 - The collision guard is proven by a test that deliberately triggers it
 - CI green on the full matrix
 
@@ -1927,7 +1927,7 @@ pf = vbt.x.PortfolioBacktest(
 )
 ```
 
-Returns a `vectorbtX.Portfolio`, so `pf.stats()`, `pf.trades.stats()`,
+Returns a `vectorbtx.Portfolio`, so `pf.stats()`, `pf.trades.stats()`,
 `pf.returns_stats()` and every `pf.x.*` extra keep working with no result wrapper to learn.
 
 **Depends on.** All of B–M. **Blocks.** Nothing — it is the last layer.
@@ -2059,6 +2059,11 @@ Tiered margin is not modelled; users set sensible maxima instead.
 
 ## Part 9 — Remaining work
 
+> ⚠️ **Superseded.** The paragraph below describes the v0.1 build and is kept for the
+> record. Current status: **245 tests pass** against a real vectorbt 1.1.0 install,
+> **60 of 63** criteria are verified, and **Section N is built** (`vectorbtx/frontend/`).
+> `audit_plan.py` has been deleted; see [`AUDIT.md`](AUDIT.md) for the live picture.
+
 **Status as of the v0.1 build.** Sections A–M are implemented. 168 tests pass. 59 of the
 63 "Done when" criteria in this document are verified by execution (`audit_plan.py`);
 the remaining 4 need a running simulation and are listed below. Section N is designed but
@@ -2069,7 +2074,7 @@ unbuilt.
 1. **✅ Section N — the front-door API.** Built and exercised; see Section N above.
 2. **⚠️ Four criteria unverified**, because they need a simulation and the build
    environment had no vectorbt installed. Run these first on a machine that does:
-   - §B — `import vectorbtX` emits no warnings
+   - §B — `import vectorbtx` emits no warnings
    - §J — `from_weights` reproduces a hand-computed monthly rebalance
    - §J — a cross-currency portfolio rebalances to correct base-currency weights
    - §K2 — Balance and Equity drawdown differ on a portfolio with open positions

@@ -3,7 +3,7 @@
 The common case, and the least code: compute the signal on the whole frame at once and pass
 it straight in. Every column gets the same rule with the same parameters.
 """
-import vectorbtX as vbt
+import vectorbtx as vbt
 
 START, END = "2019-01-01", "2024-12-31"
 

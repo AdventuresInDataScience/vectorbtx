@@ -10,7 +10,7 @@ funded at its own.
 """
 import numpy as np
 import pandas as pd
-import vectorbtX as vbt
+import vectorbtx as vbt
 
 START, END = "2019-01-01", "2024-12-31"
 

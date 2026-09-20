@@ -4,7 +4,7 @@ Lots x contract size. Financing on the FULL notional (the broker funds the whole
 you borrow nothing), Friday weekend roll, commission charged.
 
 """
-import vectorbtX as vbt
+import vectorbtx as vbt
 
 SYMBOL, START, END = "UKX", "2019-01-01", "2024-12-31"
 

@@ -37,7 +37,7 @@ cd examples/strategies && python 01_ma_cross_spreadbet_fx.py
 ### The pattern all three follow
 
 ```python
-import vectorbtX as vbt
+import vectorbtx as vbt
 
 universe = vbt.x.load_universe({...})               # 1. describe instruments once
 data     = vbt.YFData.download(symbols, ...)        # 2. get data

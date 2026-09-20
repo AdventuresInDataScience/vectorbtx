@@ -38,7 +38,7 @@ Everything upstream remains available unchanged under its usual name.
 
 Start here. `SingleBacktest` and `PortfolioBacktest` are a facade over sections 1–11 —
 **they add no behaviour**, they just remove the assembly. Both return a
-`vectorbtX.Portfolio`, so `pf.stats()`, `pf.trades.stats()`, `pf.returns_stats()` and every
+`vectorbtx.Portfolio`, so `pf.stats()`, `pf.trades.stats()`, `pf.returns_stats()` and every
 `pf.x.*` extra work with no result wrapper to learn.
 
 ### `vbt.x.PortfolioBacktest(*, close, open, high, low, **kwargs)` → `Portfolio`

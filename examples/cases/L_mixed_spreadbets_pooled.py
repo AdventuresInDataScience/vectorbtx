@@ -14,7 +14,7 @@ point: get the asset class right and the cost model, roll day and leverage tier 
 (30x here) and warns. Each column's own `max_size` still caps it individually, so the shares
 cannot secretly run at 30x — but the group can put all of its capacity into the FX legs.
 """
-import vectorbtX as vbt
+import vectorbtx as vbt
 
 START, END = "2019-01-01", "2024-12-31"
 

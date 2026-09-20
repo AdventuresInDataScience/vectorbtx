@@ -190,7 +190,7 @@ the plan assumed.
 """)
 
 if HAS_VBT:
-    import vectorbtX as vbt
+    import vectorbtx as vbt
 
     pf = vbt.Portfolio.from_weights(
         converted, weights=weights, schedule=schedule,

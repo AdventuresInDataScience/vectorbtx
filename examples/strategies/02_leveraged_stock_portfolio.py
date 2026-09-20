@@ -8,7 +8,7 @@ exactly how CFD costs end up attached to an equity column with nothing raising.
     python 02_leveraged_stock_portfolio.py
 """
 
-import vectorbtX as vbt
+import vectorbtx as vbt
 
 START, END = "2019-01-01", "2024-12-31"
 SYMBOLS = ["VOD.L", "BP.L", "MSFT", "AAPL", "NVDA"]

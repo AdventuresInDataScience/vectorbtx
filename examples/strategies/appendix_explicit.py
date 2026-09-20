@@ -26,7 +26,7 @@ position because an FX position is long one currency and short another.
     python 01_ma_cross_spreadbet_fx.py
 """
 
-import vectorbtX as vbt
+import vectorbtx as vbt
 
 # ----------------------------------------------------------------------------------
 # Parameters

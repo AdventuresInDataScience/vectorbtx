@@ -5,7 +5,7 @@ spread bet this rolls on FRIDAY and pays financing on the full notional — carr
 apply, because there is no currency pair underneath.
 
 """
-import vectorbtX as vbt
+import vectorbtx as vbt
 
 SYMBOL, START, END = "VOD.L", "2019-01-01", "2024-12-31"
 

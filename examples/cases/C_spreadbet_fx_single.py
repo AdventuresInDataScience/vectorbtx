@@ -5,7 +5,7 @@ Same product as B, different underlying — and that changes three things: the l
 CARRY rather than financing. Carry needs both sides of the pair.
 
 """
-import vectorbtX as vbt
+import vectorbtx as vbt
 
 SYMBOL, START, END = "EURUSD=X", "2019-01-01", "2024-12-31"
 

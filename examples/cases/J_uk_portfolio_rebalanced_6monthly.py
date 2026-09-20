@@ -8,7 +8,7 @@ orders.
 leading multiplier, so a naive implementation would give you a MONTHLY mask — six times the
 rebalances and six times the costs, still running and still looking plausible.
 """
-import vectorbtX as vbt
+import vectorbtx as vbt
 
 START, END = "2019-01-01", "2024-12-31"
 

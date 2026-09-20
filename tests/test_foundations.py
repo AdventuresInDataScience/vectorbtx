@@ -77,11 +77,11 @@ def test_patching_is_idempotent():
 
 @needs_vectorbt
 def test_unmodified_vectorbt_script_is_bit_identical_under_vectorbtx():
-    """The contract: `import vectorbtX as vbt` changes nothing for plain vectorbt code."""
+    """The contract: `import vectorbtx as vbt` changes nothing for plain vectorbt code."""
     import numpy as np
     import pandas as pd
     import vectorbt as plain
-    import vectorbtX as x
+    import vectorbtx as x
 
     index = pd.date_range("2020-01-01", periods=200, freq="D")
     rng = np.random.default_rng(0)
@@ -106,7 +106,7 @@ def test_native_stats_still_contain_every_upstream_metric():
     """Additive means additive: nothing upstream may disappear from .stats()."""
     import pandas as pd
     import vectorbt as plain
-    import vectorbtX as x
+    import vectorbtx as x
 
     index = pd.date_range("2020-01-01", periods=100, freq="D")
     price = pd.Series(range(100, 200), index=index, dtype=float)

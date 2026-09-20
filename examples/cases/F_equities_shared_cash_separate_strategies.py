@@ -9,7 +9,7 @@ you build the columns however you like and they travel together.
 first when cash is short. If that matters, give them separate pools — case H.
 """
 import pandas as pd
-import vectorbtX as vbt
+import vectorbtx as vbt
 
 START, END = "2019-01-01", "2024-12-31"
 

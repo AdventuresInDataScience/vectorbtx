@@ -12,7 +12,7 @@ Two names, one implementation:
 * `SingleBacktest` — a thin validating forwarder that rejects the portfolio-only
   arguments and points at `PortfolioBacktest`.
 
-Both return a `vectorbtX.Portfolio`, so `pf.stats()`, `pf.trades.stats()`,
+Both return a `vectorbtx.Portfolio`, so `pf.stats()`, `pf.trades.stats()`,
 `pf.returns_stats()` and every `pf.x.*` extra keep working with no result wrapper to
 learn.
 """

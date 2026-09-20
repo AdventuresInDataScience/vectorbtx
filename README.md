@@ -5,7 +5,7 @@ instrument abstractions, leverage, multi-currency, holding costs, portfolio cons
 and the full MT4/MT5 metric set.
 
 ```python
-import vectorbtX as vbt          # drop-in replacement for `import vectorbt as vbt`
+import vectorbtx as vbt          # drop-in replacement for `import vectorbt as vbt`
 ```
 
 Everything upstream still works, unchanged and bit-identical. Extras are additive: new
@@ -41,11 +41,22 @@ the build log live in [`docs/dev/`](docs/dev/) and are not needed to use the lib
 ## Install
 
 ```bash
-pip install -e .                 # requires vectorbt==1.1.0, numpy, pandas, scipy
-pip install -e ".[excel,rates]"  # + openpyxl for .xlsx universes, requests for FRED
+uv venv --python 3.12 && uv pip install -e ".[dev]"   # or: pip install -e ".[dev]"
+uv pip install -e ".[excel,rates]"                    # + openpyxl for .xlsx universes,
+                                                      #   requests for FRED
 ```
 
-Python 3.11–3.14, mirroring upstream.
+Python 3.11–3.14, mirroring upstream. The import name is lowercase — `import vectorbtx as
+vbt` — even though the distribution is published as `vectorbtX`.
+
+Two things that will bite you on a first install:
+
+- **`plotly<7` is pinned, and it is not optional.** vectorbt 1.1.0 declares `plotly>=4.12.0`
+  with no upper bound but registers a plotly template containing a `scattermapbox` key,
+  which plotly 7 removed. Without the cap, `import vectorbt` itself raises `ValueError`
+  before any of this library loads. 6.9.0 is the newest that works.
+- **Behind a TLS-inspecting proxy, `uv` needs `--native-tls`**, or it fails every fetch with
+  `invalid peer certificate: UnknownIssuer`.
 
 ---
 
@@ -54,7 +65,7 @@ Python 3.11–3.14, mirroring upstream.
 One call. Every argument in it. Returns a `Portfolio`.
 
 ```python
-import vectorbtX as vbt
+import vectorbtx as vbt
 
 data = vbt.YFData.download("EURUSD=X", start="2019-01-01", end="2024-12-31")
 close, open_ = data.get("Close"), data.get("Open")
@@ -268,10 +279,9 @@ Mirrors upstream's own 39-line `__init__.py` shape.
 | `README.md` | This file: what vectorbtX is, the complete file map, the call graph, known limitations, and the log of corrections. |
 | `docs/API.md` | API reference — every public symbol with signature, arguments, raises and an example. |
 | `docs/EXAMPLES.md` | Guide to the runnable examples: the three strategies and the nine-file reference tour. |
-| `docs/dev/PLAN.md` | The design plan, Sections A–N. Section N (front-door API) is marked NOT IMPLEMENTED; Part 9 lists everything outstanding. |
-| `docs/dev/AUDIT.md` | Mechanical verification of the plan's 63 acceptance criteria, plus the scope-creep sweep. |
+| `docs/dev/PLAN.md` | The design plan, Sections A–N. Part 9 lists everything outstanding. Section N (front-door API) is marked NOT IMPLEMENTED there; it has since been built — see `vectorbtx/frontend/`. |
+| `docs/dev/AUDIT.md` | Verification of the plan's 63 acceptance criteria, plus the scope-creep sweep. Now a static record: the `audit_plan.py` that generated it has been removed. |
 | `docs/dev/FRONTEND-API.md` | The agreed front-door API design, with complete worked examples. |
-| `audit_plan.py` | The audit itself — run it. |
 
 ### `vectorbtx/x.py`
 
@@ -684,7 +694,7 @@ default when the rows mix returns, ratios and durations.
 ## Call graph
 
 ```
-import vectorbtX
+import vectorbtx
   └─ core.patch.apply_patches
        ├─ metrics.returns.register.register_returns_metrics ──► ReturnsAccessor
        ├─ metrics.trades.register.register_trade_metrics ─────► Trades, Portfolio
@@ -764,15 +774,19 @@ dividends for nominal-point modes; asymmetric bid/ask; compounding-equity risk s
 ## Testing
 
 ```bash
-pytest                                     # full suite, needs vectorbt installed
-python run_tests.py                        # offline runner, no pytest required
-
-# Run everything — including the simulation paths — with no compiler toolchain:
-NUMBA_DISABLE_JIT=1 PYTHONPATH=devshim python run_tests.py
+pytest                                     # full suite
+cd examples/cases      && python _harness.py   # all 12 case files, offline
+cd examples/strategies && python _harness.py   # all 3 strategies, offline
 ```
 
-**225 tests** pass against vectorbt 1.1.0; 202 of them are pure NumPy/pandas arithmetic
-and run without vectorbt at all.
+**245 tests pass against a real vectorbt 1.1.0 install** — vectorbt 1.1.0, numba 0.67.0,
+numpy 2.5.3, pandas 3.0.6, plotly 6.9.0, on Python 3.12 / Windows. No failures, no skips.
+Most are pure NumPy/pandas arithmetic and run without vectorbt at all.
+
+**The numba kernels really are compiled.** All three level-3 kernels in
+`holding/callback.py` — `order_func_nb`, `pre_segment_func_nb`, `post_segment_func_nb` —
+acquire numba signatures on first call and survive type inference unchanged. A
+`from_holding_costs` run costs ~8.4s cold (almost entirely compilation) and ~0.02s warm.
 
 Two test files are worth knowing about:
 
@@ -783,12 +797,13 @@ Two test files are worth knowing about:
 - `tests/test_holding_sim.py` — regressions for the four simulation-path defects found by
   actually executing the engine paths.
 
-`devshim/` holds pure-Python stand-ins for vectorbt's uncompiled dependencies. It is a
-test harness, never imported by the library.
-
 Most of the library is pure NumPy/pandas arithmetic and is testable **without vectorbt or
 numba installed** — `tests/conftest.py` detects their absence and imports the package's
 submodules directly. Tests needing a real simulation are marked and skipped.
+
+⚠️ **`Portfolio.from_weights` has no direct test.** Section J is covered only indirectly,
+via `vbt.x.PortfolioBacktest`. See [`docs/dev/AUDIT.md`](docs/dev/AUDIT.md) §1 — it is the
+largest known coverage gap.
 
 The worked numerical examples double as the regression suite: they encode not just "does
 this run" but "does this still produce the number we agreed was correct", which is what

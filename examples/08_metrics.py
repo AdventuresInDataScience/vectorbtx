@@ -248,7 +248,7 @@ the bars it is given.
 
 if HAS_VBT:
     header("14. Live — the metrics in .stats()")
-    import vectorbtX as vbt
+    import vectorbtx as vbt
 
     rets = pd.Series(RETS, index=pd.date_range("2023-01-01", periods=len(RETS), freq="D"))
     acc = rets.vbt.returns(freq="D", year_freq="365d")

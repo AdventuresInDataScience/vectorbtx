@@ -40,7 +40,7 @@ def SingleBacktest(*, close=None, open=None, high=None, low=None, **kwargs):
         **kwargs: see `PortfolioBacktest`.
 
     Returns:
-        `vectorbtX.Portfolio`.
+        `vectorbtx.Portfolio`.
 
     Raises:
         BacktestError: if `price` has more than one column, or a portfolio-only argument

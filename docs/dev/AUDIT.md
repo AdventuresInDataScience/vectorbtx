@@ -1,23 +1,31 @@
 # Audit — plan compliance, API compliance, and scope creep
 
-Produced by `audit_plan.py`, which **exercises** the code rather than inspecting it.
-No criterion passes on the basis of a symbol merely existing.
+Was produced by `audit_plan.py`, which **exercised** the code rather than inspecting it.
+No criterion passed on the basis of a symbol merely existing.
 
-Run it: `python audit_plan.py`
+> ⚠️ **`audit_plan.py` has been deleted** as a sandbox-era build tool. This file is now the
+> record rather than a regenerable report. Its final run was against a real vectorbt 1.1.0
+> install; the numbers below are from that run. To revive it, recover it from the initial
+> commit — but prefer promoting the four open criteria below into `tests/` instead.
 
 ## 1. Plan compliance — 63 criteria from the plan's "Done when" blocks
 
-**59 pass. 0 fail. 4 unverifiable in this environment** (they need a running
-simulation, and vectorbt is not installed here):
+**59 pass. 0 fail. 4 never implemented as checks.**
 
-| Section | Unverifiable criterion |
-|---|---|
-| B | `import vectorbtX` emits no warnings |
-| J | `from_weights` reproduces a hand-computed monthly rebalance |
-| J | a cross-currency portfolio rebalances to correct base-currency weights |
-| K2 | Balance and Equity drawdown differ on a portfolio with open positions |
+The four below were written as hardcoded `CANNOT VERIFY` stubs when vectorbt was
+unavailable, and were never filled in once it was. Only the first has since been settled:
 
-These are the first things to run on a machine with vectorbt installed.
+| Section | Criterion | Status |
+|---|---|---|
+| B | `import vectorbtx` emits no warnings | ✅ **Verified** — 0 warnings on import against vectorbt 1.1.0 |
+| J | `from_weights` reproduces a hand-computed monthly rebalance | ❌ **Still unverified** |
+| J | a cross-currency portfolio rebalances to correct base-currency weights | ❌ **Still unverified** |
+| K2 | Balance and Equity drawdown differ on a portfolio with open positions | ❌ **Still unverified** |
+
+⚠️ **`Portfolio.from_weights` has no direct test.** Section J is exercised only
+indirectly, through `vbt.x.PortfolioBacktest` in `tests/test_frontend.py`. The two J
+criteria above are the specific numbers nobody has ever checked. This is the largest
+remaining coverage gap and the obvious next piece of work.
 
 ### Gaps the audit found and fixed
 
@@ -28,13 +36,13 @@ These are the first things to run on a machine with vectorbt installed.
 | F | "`raise_reject=True` demonstrably rejects one" — only ever mentioned in a docstring | test confirming it is a genuine `Order` field, i.e. real passthrough, not an invention |
 | F | "Borrowed portion correct for cash-covered, partially financed, fully leveraged" — untestable, buried inside a `pf`-taking function | extracted `borrowed_amount(asset_value, free_cash)` as pure arithmetic; six tests covering all three cases plus shorts and negative cash |
 
-## 2. API compliance — the agreed front door is NOT built
+## 2. API compliance — the agreed front door IS built
 
 `docs/dev/FRONTEND-API.md` settles on `vbt.x.SingleBacktest` / `vbt.x.PortfolioBacktest`.
 
-**Neither exists.** The agreed API is designed and documented, not implemented. Nothing in
-the codebase has changed to support it. That is the largest outstanding item, and it is a
-build task, not a gap in v0.1.
+**Both now exist** (`vectorbtx/frontend/`) and are covered by `tests/test_frontend.py`.
+This section previously recorded them as unimplemented; that was true of v0.1 and is no
+longer.
 
 ## 3. Scope creep found and removed
 
@@ -69,7 +77,12 @@ internally, exported through `vbt.x`, or covered by a test.
 
 ## 4. Current state
 
-- **168 tests pass, 0 fail, 4 skipped** (the skips need vectorbt)
-- **59/63 plan criteria verified by execution**, 4 need a simulation
-- All 9 tour examples and 3 strategies run
-- The agreed v6 API is **not implemented**
+Measured against a real vectorbt 1.1.0 install (numba 0.67.0, numpy 2.5.3, pandas 3.0.6,
+plotly 6.9.0, Python 3.12):
+
+- **245 tests pass, 0 fail, 0 skipped**
+- **60/63 plan criteria verified**; 3 remain unimplemented as checks (all Section J/K2 —
+  see §1)
+- All 12 case files and all 3 strategies run through their harnesses
+- All three numba kernels in `holding/callback.py` compile and pass type inference
+- The agreed v6 API **is implemented**

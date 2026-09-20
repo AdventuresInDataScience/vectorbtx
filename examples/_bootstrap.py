@@ -2,7 +2,7 @@
 
 The examples are runnable in two environments:
 
-* with vectorbt installed — `import vectorbtX as vbt` works and simulations run;
+* with vectorbt installed — `import vectorbtx as vbt` works and simulations run;
 * without it — the pure-arithmetic parts still run, so every example that does not need a
   simulation is genuinely executable.
 
@@ -16,7 +16,7 @@ import types
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
-    import vectorbtX as vbt
+    import vectorbtx as vbt
 
     x = vbt.x
     HAS_VBT = True

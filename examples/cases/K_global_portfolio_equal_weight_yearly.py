@@ -10,7 +10,7 @@ in one backtest and every number after it is wrong.
 weighting derived from price — momentum, volatility, market cap — is meaningless across
 unconverted currencies.
 """
-import vectorbtX as vbt
+import vectorbtx as vbt
 
 START, END = "2019-01-01", "2024-12-31"
 

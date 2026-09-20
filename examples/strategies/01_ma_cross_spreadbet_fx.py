@@ -14,7 +14,7 @@ units", never quantize by hand, and never splat a resolved argument dict. See
 when you would want that instead.
 """
 
-import vectorbtX as vbt
+import vectorbtx as vbt
 
 # ----------------------------------------------------------------------------------
 # Parameters

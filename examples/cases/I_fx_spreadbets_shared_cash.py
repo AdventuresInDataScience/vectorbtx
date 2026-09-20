@@ -5,7 +5,7 @@ declared, because the carry differential is specific to it. That is what the per
 `instruments` dict is for.
 """
 import pandas as pd
-import vectorbtX as vbt
+import vectorbtx as vbt
 
 START, END = "2019-01-01", "2024-12-31"
 

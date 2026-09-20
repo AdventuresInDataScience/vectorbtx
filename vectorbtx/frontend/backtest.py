@@ -82,7 +82,7 @@ def PortfolioBacktest(
     init_cash=None,
     **kwargs,
 ):
-    """Run a backtest from one call and return a `vectorbtX.Portfolio`.
+    """Run a backtest from one call and return a `vectorbtx.Portfolio`.
 
     Args:
         close: close price, one column per instrument. Signals are computed on it and the
@@ -112,7 +112,7 @@ def PortfolioBacktest(
         **kwargs: anything else, forwarded to the underlying vectorbt constructor.
 
     Returns:
-        `vectorbtX.Portfolio`.
+        `vectorbtx.Portfolio`.
 
     Raises:
         BacktestError: on a missing or unknown `mode`, an argument a mode rejects, two

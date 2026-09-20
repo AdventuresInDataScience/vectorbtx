@@ -6,7 +6,7 @@ borrowed, not the whole position. That last point is what separates margin share
 from a CFD (case A), where the broker funds everything.
 
 """
-import vectorbtX as vbt
+import vectorbtx as vbt
 
 SYMBOL, START, END = "MSFT", "2019-01-01", "2024-12-31"
 

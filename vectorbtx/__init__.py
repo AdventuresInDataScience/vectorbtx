@@ -1,6 +1,6 @@
 """vectorbtX — a pure wrapper over vectorbt 1.1.0.
 
-    import vectorbtX as vbt
+    import vectorbtx as vbt
 
 is a drop-in replacement for `import vectorbt as vbt`. Everything upstream still works
 unchanged; extras are additive and live under the `.x` namespace, except metrics, which

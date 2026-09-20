@@ -10,7 +10,7 @@ minimum-trade filter so tiny corrections are not paid for.
     python 03_monthly_rebalanced_investing.py
 """
 
-import vectorbtX as vbt
+import vectorbtx as vbt
 
 START, END = "2015-01-01", "2024-12-31"
 INIT_CASH = 250_000.0

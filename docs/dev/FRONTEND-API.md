@@ -46,7 +46,7 @@ case, it is a misunderstanding of the product.
 ## 2. Single instrument — spread bet on EURUSD
 
 ```python
-import vectorbtX as vbt
+import vectorbtx as vbt
 
 START, END = "2019-01-01", "2024-12-31"
 
@@ -118,7 +118,7 @@ print(pf.x.user_size().iloc[-1])             # "£1.66/pt", not 16600 engine uni
 Five UK equities, same broker, same terms.
 
 ```python
-import vectorbtX as vbt
+import vectorbtx as vbt
 
 START, END = "2019-01-01", "2024-12-31"
 SYMBOLS = ["VOD.L", "BP.L", "AZN.L", "SHEL.L", "HSBA.L"]
@@ -173,7 +173,7 @@ Two currencies, three cost structures. A per-symbol `mode` overrides the shared 
 is how one CFD sits in a book of equities.
 
 ```python
-import vectorbtX as vbt
+import vectorbtx as vbt
 
 START, END = "2019-01-01", "2024-12-31"
 SYMBOLS = ["VOD.L", "BP.L", "MSFT", "AAPL", "NVDA"]
@@ -266,7 +266,7 @@ NVDA,cfd,stocks,0.01,1.0,USD,USD,0.0005,,,2.0,auto,0.005,5.0,FALSE,CFD broker B
 `notes` is not a schema field; it is preserved through round-trip export.
 
 ```python
-import vectorbtX as vbt
+import vectorbtx as vbt
 
 START, END = "2019-01-01", "2024-12-31"
 
@@ -314,7 +314,7 @@ print(pf.stats())
 ## 6. Portfolio, form 4 — `Instrument` objects, for reuse
 
 ```python
-import vectorbtX as vbt
+import vectorbtx as vbt
 
 START, END = "2019-01-01", "2024-12-31"
 
@@ -377,7 +377,7 @@ print(pf.stats())
 ## 7. Rebalanced investing — same class, different arguments
 
 ```python
-import vectorbtX as vbt
+import vectorbtx as vbt
 
 START, END = "2015-01-01", "2024-12-31"
 

@@ -1,6 +1,6 @@
 """Run the case files offline, against real vectorbtX.
 
-The case files are written for the real world — `import vectorbtX as vbt`,
+The case files are written for the real world — `import vectorbtx as vbt`,
 `vbt.YFData.download(...)`, `vbt.x.FREDData.download_rates(...)` — so they are genuinely
 copy-pasteable. This harness runs them without a network by substituting **only** the two
 things that need one:
@@ -87,7 +87,7 @@ class _StubFRED:
 
     @classmethod
     def download_rates(cls, currencies, start=None, end=None, **kwargs):
-        import vectorbtX as real
+        import vectorbtx as real
 
         index = pd.date_range(start or "2019-01-01", end or "2024-12-31", freq="B")
         return real.x.static_rate_table(list(currencies), index,
@@ -111,7 +111,7 @@ class _StubMA:
 
 def build_vbt():
     """The real vectorbtX, with only the networked data sources replaced."""
-    import vectorbtX as real
+    import vectorbtx as real
 
     vbt = types.ModuleType("vectorbtX")
     for name in dir(real):
@@ -125,7 +125,11 @@ def build_vbt():
 
 
 def run(path):
-    src = open(path).read().replace("import vectorbtX as vbt", "# [harness] vbt injected")
+    # encoding is explicit: the case files contain £, ⚠ and em-dashes, and Windows
+    # defaults `open()` to cp1252, which cannot decode them.
+    src = open(path, encoding="utf-8").read().replace(
+        "import vectorbtx as vbt", "# [harness] vbt injected"
+    )
     exec(compile(src, path, "exec"), {"__name__": "__main__", "vbt": build_vbt()})
 
 

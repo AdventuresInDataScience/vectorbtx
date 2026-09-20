@@ -1,6 +1,6 @@
 """Run the strategy examples against stubbed data sources.
 
-The strategy files are written for the real world: `import vectorbtX as vbt`,
+The strategy files are written for the real world: `import vectorbtx as vbt`,
 `vbt.YFData.download(...)`, `vbt.x.FREDData.download_rates(...)`. This harness executes
 everything in them that does not need vectorbt's simulation engine, substituting
 deterministic synthetic prices for Yahoo and a static table for FRED.
@@ -177,7 +177,7 @@ def build_vbt_stub():
                                         {c: defaults[c] for c in currencies})
 
     if HAS_VBT:
-        import vectorbtX as _real
+        import vectorbtx as _real
 
         vbt.Portfolio = _real.Portfolio
         vbt.Instrument = _real.Instrument
@@ -193,11 +193,13 @@ def build_vbt_stub():
 
 
 def run(path):
-    src = open(path).read()
+    # Explicit encoding: these files contain £ and ⚠, which cp1252 (the Windows
+    # default for `open()`) cannot decode.
+    src = open(path, encoding="utf-8").read()
     src = src.replace("pf.plot().show()", "pass  # [harness] plotting skipped")
     module_globals = {"__name__": "__main__", "vbt": build_vbt_stub()}
     # Strip the import; the stub is injected instead.
-    src = src.replace("import vectorbtX as vbt", "# [harness] vbt injected")
+    src = src.replace("import vectorbtx as vbt", "# [harness] vbt injected")
     exec(compile(src, path, "exec"), module_globals)
 
 

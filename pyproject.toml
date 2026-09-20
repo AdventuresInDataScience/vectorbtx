@@ -13,6 +13,12 @@ dependencies = [
     "numpy>=2.4.6",
     "pandas>=3.0.3,<4.0",
     "scipy",
+    # ⚠️ Not ours to fix, but load-bearing. vectorbt 1.1.0 declares `plotly>=4.12.0` with
+    # no upper bound, and registers a plotly template containing a `scattermapbox` key
+    # (`vectorbt/_settings.py:96`). plotly 7 removed that trace type, so `import vectorbt`
+    # raises ValueError at import time and NOTHING works. 6.9.0 is the newest that loads.
+    # Remove this once vectorbt caps plotly itself.
+    "plotly<7",
 ]
 
 [project.optional-dependencies]
@@ -23,10 +29,12 @@ dev = ["pytest", "pytest-cov"]
 [tool.setuptools.packages.find]
 include = ["vectorbtx*"]
 
-# `vectorbtX.py` is a case alias so `import vectorbtX` works on case-sensitive
-# filesystems (Linux). See the module docstring. It must ship as a top-level module.
-[tool.setuptools]
-py-modules = ["vectorbtX"]
+# The importable name is lowercase `vectorbtx`, always. There was once a `vectorbtX.py`
+# case-alias module so `import vectorbtX` worked on case-sensitive filesystems; it was
+# removed because setuptools' editable-install finder maps BOTH spellings straight to the
+# package directory, so the alias never executed and the two names became two distinct
+# module objects — forking the patch flag and re-running `apply_patches()`. One spelling
+# is the fix. The distribution is still published as `vectorbtX`; PyPI normalises the case.
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

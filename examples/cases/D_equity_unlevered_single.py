@@ -4,7 +4,7 @@ The simplest case in the library, and the baseline the others are judged against
 shares, flat commission, no margin loan, no financing.
 
 """
-import vectorbtX as vbt
+import vectorbtx as vbt
 
 SYMBOL, START, END = "MSFT", "2019-01-01", "2024-12-31"
 
