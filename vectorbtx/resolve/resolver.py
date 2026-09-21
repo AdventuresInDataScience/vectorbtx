@@ -84,6 +84,27 @@ def resolve_universe(
     specs = universe.order_for(columns)
     price = _price_frame(data, columns)
 
+    # ⚠️ An empty price frame is not a cost-resolution problem, but that is where it used
+    # to surface — `IndexError: index 0 is out of bounds for size 0` from `arr.flat[0]`
+    # deep inside `costs/compose.py`, which tells the reader nothing.
+    #
+    # In practice this means one thing: a multi-exchange download whose sessions never
+    # aligned. Yahoo stamps daily bars at LOCAL midnight, so LSE bars land on 00:00 UTC
+    # and US bars on 05:00 UTC; `missing_index="drop"` then intersects to *nothing*, with
+    # all the columns still present so nothing else looks wrong.
+    if len(price.index) == 0:
+        from .load import UniverseError  # local: load.py imports this module
+
+        raise UniverseError(
+            f"The price data has {len(columns)} column(s) but no rows, so nothing can be "
+            f"resolved. The usual cause is aligning instruments from different exchanges: "
+            f"daily bars are timestamped at each market's own midnight (LSE at 00:00 UTC, "
+            f"US at 05:00 UTC), so an index intersection is empty even though both series "
+            f"have data. Normalise the timestamps to dates before aligning — e.g. "
+            f"`frame.index = frame.index.tz_localize(None).normalize()` on each source, "
+            f"then combine. Columns seen: {list(columns)}."
+        )
+
     out: dict = {}
 
     if include_quantization:

@@ -39,13 +39,22 @@ class PortfolioXAccessor:
         """See `vectorbtx.margin.exposure.margin_level`."""
         from ..margin.exposure import margin_level
 
-        return margin_level(self._pf, universe or self.universe, **kwargs)
+        return margin_level(self._pf, self._resolve_universe(universe), **kwargs)
 
     def min_margin_level(self, universe=None, **kwargs):
         """See `vectorbtx.margin.exposure.min_margin_level`."""
         from ..margin.exposure import min_margin_level
 
-        return min_margin_level(self._pf, universe or self.universe, **kwargs)
+        return min_margin_level(self._pf, self._resolve_universe(universe), **kwargs)
+
+    def _resolve_universe(self, universe):
+        """Explicit argument first, then whatever the portfolio carries.
+
+        `universe or self.universe` would be wrong for a `Universe` that defines
+        `__len__`: an empty one is falsy and would be silently swapped for the
+        portfolio's. Identity against None is the only safe test.
+        """
+        return universe if universe is not None else self.universe
 
     def drift(self):
         """Quantization drift recorded at construction, or None."""

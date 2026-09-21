@@ -42,6 +42,29 @@ def test_attach_succeeds_on_a_free_name():
     del _Host.brand_new
 
 
+def test_attach_blames_double_patching_not_upstream_when_it_attached_the_name_itself():
+    """A re-attach is a *different fault* from an upstream collision and must say so.
+
+    Re-running `apply_patches()` means `vectorbtx` has been imported as two module
+    objects, each with its own `_APPLIED` flag. Reporting that as "already exists
+    upstream" sends the reader hunting through vectorbt for a method that is not there —
+    which is exactly what the deleted `vectorbtX.py` case alias caused.
+    """
+    attach(_Host, "ours", lambda self: "v1")
+    try:
+        with pytest.raises(ShadowError, match="attached by vectorbtX, not by upstream"):
+            attach(_Host, "ours", lambda self: "v2")
+        assert _Host.ours(None) == "v1"  # the first attachment is left intact
+    finally:
+        del _Host.ours
+
+
+def test_an_upstream_collision_is_still_reported_as_upstream():
+    """The tag must not make every collision look like double-patching."""
+    with pytest.raises(ShadowError, match="already exists upstream"):
+        attach(_Host, "existing", lambda self: None)
+
+
 def test_attach_overwrite_is_opt_in_and_explicit():
     attach(_Host, "existing", lambda self: "ours", overwrite=True)
     assert _Host.existing(None) == "ours"

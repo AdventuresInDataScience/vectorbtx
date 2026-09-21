@@ -20,6 +20,12 @@ import pandas as pd
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, ROOT)
 
+# The strategies print ⚠ and £; a Windows console stdout is cp1252 and cannot encode the
+# first. Without this a strategy dies mid-output with UnicodeEncodeError. See _bootstrap.py.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):  # pragma: no cover - platform-dependent
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 try:
     import vectorbt  # noqa: F401
 
@@ -87,7 +93,15 @@ class _StubData:
             else:
                 raise KeyError(field)
         frame = pd.DataFrame(cols)
-        return frame[self.symbols[0]] if len(self.symbols) == 1 else frame
+        if len(self.symbols) == 1:
+            # ⚠️ Match real vectorbt exactly: a single-symbol download returns a Series
+            # named after the FIELD ("Close"), not after the symbol. This stub used to
+            # return it named after the symbol, which is strictly more generous than
+            # reality — and it hid a bug that broke three of the four strategies against
+            # live Yahoo. A stub that is kinder than the thing it stands in for is worse
+            # than no stub.
+            return frame[self.symbols[0]].rename(field)
+        return frame
 
 
 class _StubYFData:

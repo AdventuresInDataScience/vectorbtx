@@ -21,13 +21,45 @@ BASE = "GBP"
 # ----------------------------------------------------------------------------------
 # 1. Data
 # ----------------------------------------------------------------------------------
-data = vbt.YFData.download(SYMBOLS, start=START, end=END, missing_index="drop")
-price_native = data.get("Close")
-open_native = data.get("Open")
-high_native, low_native = data.get("High"), data.get("Low")
-volume = data.get("Volume")
+# ⚠️ This universe spans two exchanges (LSE and NASDAQ), and that needs care with Yahoo.
+# Daily bars are timestamped at each market's **local** midnight, so LSE arrives on
+# 00:00 UTC and US on 05:00 UTC. The two indices therefore never intersect: passing
+# `missing_index="drop"` here returns **zero rows** while keeping all five columns, so
+# the frame still looks structurally correct and the failure surfaces much later.
+#
+# Normalise to calendar dates first, then align. `.first()` skips NaN, so the two
+# half-populated rows for a given date collapse into one complete row.
+data = vbt.YFData.download(SYMBOLS, start=START, end=END)
 
-fx = vbt.YFData.download("GBPUSD=X", start=START, end=END)
+
+def by_date(frame):
+    frame = frame.copy()
+    frame.index = frame.index.tz_localize(None).normalize()
+    return frame.groupby(level=0).first()
+
+
+price_native = by_date(data.get("Close"))
+open_native = by_date(data.get("Open"))
+high_native, low_native = by_date(data.get("High")), by_date(data.get("Low"))
+volume = by_date(data.get("Volume"))
+
+# Keep only days every instrument actually traded, and keep every field on that one
+# calendar — a field-by-field dropna would silently give them different indices.
+TRADING_DAYS = price_native.dropna(how="any").index
+price_native = price_native.loc[TRADING_DAYS]
+open_native = open_native.loc[TRADING_DAYS]
+high_native, low_native = high_native.loc[TRADING_DAYS], low_native.loc[TRADING_DAYS]
+volume = volume.loc[TRADING_DAYS]
+
+# The rate series must land on the same calendar as the prices, so it gets the same
+# treatment. `.rename` is needed because a SINGLE-symbol `Data.get()` returns a Series
+# named after the field ("Close"), not the symbol — and the pair name is what tells
+# `to_base_currency` which currencies the rate is between.
+fx = by_date(
+    vbt.YFData.download("GBPUSD=X", start=START, end=END)
+    .get("Close").rename("GBPUSD=X").to_frame()
+)["GBPUSD=X"]
+
 rates = vbt.x.FREDData.download_rates(["GBP", "USD"], start=START, end=END)
 
 # ----------------------------------------------------------------------------------

@@ -1,8 +1,10 @@
 """Section K2 — MT4/MT5 trade metrics against hand-computed values."""
 
 import numpy as np
+import pandas as pd
 import pytest
 
+from conftest import needs_vectorbt
 from vectorbtx.metrics.trades import calc
 
 PNL = np.array([100.0, -50.0, 30.0, 40.0, -20.0, -10.0, 60.0])
@@ -94,3 +96,61 @@ def test_lr_metrics_come_from_the_shared_regression():
 def test_empty_input_returns_nan_not_zero():
     assert np.isnan(calc.total_net_profit(np.array([])))
     assert np.isnan(calc.z_score(np.array([1.0])))
+
+
+# ############# The open-position criterion ############# #
+
+
+@needs_vectorbt
+def test_balance_and_equity_drawdown_differ_on_a_portfolio_with_open_positions():
+    """Section K2's last "Done when", never implemented as a check until now.
+
+    The two drawdowns answer different questions and MT4/MT5 users expect both:
+
+    * **Balance** drawdown runs on `init_cash + cumsum(closed-trade pnl)`. An open
+      position has contributed no closed pnl, so it cannot move the balance curve.
+    * **Equity** drawdown is mark-to-market and follows the position down.
+
+    One asset, bought on the first bar and never sold, priced 100 → 60 → 90:
+
+    * Closed trades: **none**. The balance curve is flat at £10,000, so balance
+      drawdown is **0**.
+    * Equity peaks at £10,000 and troughs at £6,000, so equity drawdown is
+      **0.4** — a 40% fall the balance curve cannot see.
+
+    If these two ever come out equal, one of them has been wired to the wrong series,
+    which is the failure this criterion exists to catch.
+    """
+    import vectorbtx as vbt
+
+    idx = pd.date_range("2024-01-01", periods=3, freq="D")
+    close = pd.DataFrame({"A": [100.0, 60.0, 90.0]}, index=idx)
+    size = pd.DataFrame({"A": [100.0, np.nan, np.nan]}, index=idx)  # buy once, hold
+
+    pf = vbt.Portfolio.from_orders(close, size=size, init_cash=10_000, freq="D")
+
+    assert len(pf.trades.records) == 1, "expected exactly one position"
+    assert pf.trades.records["status"][0] == 0, "the position must still be open"
+
+    equity_dd = abs(float(np.ravel(np.asarray(pf.max_drawdown()))[0]))
+    balance_dd = float(
+        np.ravel(np.asarray(pf.trades.balance_drawdown(init_cash=10_000.0)))[0]
+    )
+
+    assert equity_dd == pytest.approx(0.4)
+    assert balance_dd == pytest.approx(0.0)
+    assert equity_dd > balance_dd
+
+
+@needs_vectorbt
+def test_the_hardcoded_closed_status_matches_the_upstream_enum():
+    """`register._STATUS_CLOSED` is a literal so the module imports without vectorbt.
+
+    That is only safe while it still agrees with upstream, so pin it here rather than
+    discovering the drift through wrong numbers.
+    """
+    from vectorbt.portfolio.enums import TradeStatus
+
+    from vectorbtx.metrics.trades.register import _STATUS_CLOSED
+
+    assert _STATUS_CLOSED == TradeStatus.Closed

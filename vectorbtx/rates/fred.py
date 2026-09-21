@@ -84,7 +84,21 @@ def _fetch(series_id: str, start=None, end=None, api_key=None) -> pd.Series:
     if end is not None:
         params["observation_end"] = pd.Timestamp(end).strftime("%Y-%m-%d")
     response = requests.get(FRED_URL, params=params, timeout=30)
-    response.raise_for_status()
+    if not response.ok:
+        # ⚠️ Never let `raise_for_status()` surface. It embeds the full request URL in the
+        # message — including `api_key=` — so the key ends up in tracebacks, CI logs and
+        # bug reports. Report FRED's own error text against the series instead.
+        try:
+            detail = response.json().get("error_message", "")
+        except Exception:  # pragma: no cover - non-JSON error body
+            detail = ""
+        raise RuntimeError(
+            f"FRED rejected the request for series {series_id!r} "
+            f"(HTTP {response.status_code}){': ' + detail if detail else ''}. "
+            f"'The series does not exist' usually means the ID has been renamed or "
+            f"discontinued upstream — check it at https://fred.stlouisfed.org/series/"
+            f"{series_id}."
+        )
     payload = json.loads(response.text)
     rows = [
         (pd.Timestamp(o["date"]), float(o["value"]))
@@ -92,10 +106,69 @@ def _fetch(series_id: str, start=None, end=None, api_key=None) -> pd.Series:
         if o.get("value") not in (".", "", None)
     ]
     if not rows:
-        raise RuntimeError(f"FRED returned no observations for {series_id}")
+        # Distinguish "nothing in your window" from "no such series" — the latter is
+        # already handled above, so reaching here means the series exists but has been
+        # discontinued before the period asked for, or has not published in it yet.
+        raise RuntimeError(
+            f"FRED series {series_id!r} exists but published no observations between "
+            f"{params.get('observation_start', 'its start')} and "
+            f"{params.get('observation_end', 'its end')}. The usual cause is a "
+            f"discontinued series: FRED has no daily JPY or CHF overnight benchmark, so "
+            f"TONA and SARON map to monthly OECD series that stopped in 2023-12 and "
+            f"2024-03. Use vbt.x.static_rate_table for those currencies, or pass your "
+            f"own rate table. See https://fred.stlouisfed.org/series/{series_id}."
+        )
     index, values = zip(*rows)
+    _warn_if_coverage_falls_short(series_id, index[-1], end)
     # FRED quotes these in percent; vectorbtX works in fractions throughout.
     return pd.Series([v / 100.0 for v in values], index=pd.DatetimeIndex(index), name=series_id)
+
+
+def _as_symbol_list(symbols):
+    """One symbol or many, always as a list.
+
+    ⚠️ A bare string is iterable, so `for s in "SOFR"` walks the *characters* and asks
+    FRED for a series called "S". Upstream's `Data.download` normalises this and
+    `YFData.download("MSFT")` therefore works; the overrides here bypass that, so the
+    same call against FRED failed with "The series does not exist" naming a single letter.
+    """
+    if isinstance(symbols, str) or not isinstance(symbols, (list, tuple, set)):
+        return [symbols]
+    return list(symbols)
+
+
+#: How far a series may lag the requested end date before it is worth saying so. Rates are
+#: published with a short lag and skip holidays, so a couple of weeks is unremarkable.
+_STALE_AFTER = pd.Timedelta(days=21)
+
+
+def _warn_if_coverage_falls_short(series_id, last_obs, end) -> None:
+    """Warn when a series stops well before the period asked for.
+
+    ⚠️ This is a silent-wrong-number guard, not housekeeping. Rates are forward-filled
+    onto the backtest index, so a series that was discontinued in 2023 does not fail for a
+    2025 backtest — it quietly charges every bar at the last rate it ever published.
+
+    It matters today: FRED carries no daily JPY or CHF overnight benchmark, so `TONA` and
+    `SARON` resolve to OECD *monthly* "Immediate Rates" series that stopped updating in
+    December 2023 and March 2024 respectively. They are the best FRED offers; the
+    financing they imply for recent periods is a stale constant, and the user should hear
+    that from the library rather than infer it from a suspiciously smooth cost curve.
+    """
+    if end is None:
+        return
+    requested_end = pd.Timestamp(end)
+    if pd.Timestamp(last_obs) + _STALE_AFTER >= requested_end:
+        return
+    warnings.warn(
+        f"FRED series {series_id!r} ends at {pd.Timestamp(last_obs).date()}, but the "
+        f"backtest runs to {requested_end.date()}. The last published rate will be "
+        f"forward-filled across the gap, so financing and carry after that date are a "
+        f"constant rather than a measured one. Supply your own table via "
+        f"vbt.x.static_rate_table or rate_table(source='static') if that matters.",
+        UserWarning,
+        stacklevel=3,
+    )
 
 
 def _lazy_data_base():
@@ -181,6 +254,7 @@ class FREDData:
         """
         if series_ids is None:
             series_ids = list(DEFAULT_SERIES.values())
+        series_ids = _as_symbol_list(series_ids)
         data = {
             s: cls.download_symbol(s, start=start, end=end, cache=cache, **kwargs)
             for s in series_ids
@@ -200,7 +274,7 @@ class FREDData:
             DataFrame with one column per currency, annualised rates as fractions.
         """
         out = {}
-        for ccy in currencies:
+        for ccy in _as_symbol_list(currencies):
             name = DEFAULT_SERIES.get(str(ccy).upper())
             if name is None:
                 raise ValueError(

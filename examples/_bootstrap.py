@@ -15,6 +15,15 @@ import types
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# The examples print ✓, ⚠ and £. Windows gives a fresh console cp1252 stdout, which cannot
+# encode the first two, so the example dies with UnicodeEncodeError partway through its
+# output — after doing the work, which makes it look like a library fault rather than a
+# console one. Force UTF-8; `errors="replace"` keeps a terminal that genuinely cannot
+# render a glyph from killing the run.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):  # pragma: no cover - platform-dependent
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 try:
     import vectorbtx as vbt
 
@@ -37,10 +46,3 @@ def header(title):
     print("\n" + "=" * 68)
     print(title)
     print("=" * 68)
-
-
-def needs_vbt(what="this example"):
-    if not HAS_VBT:
-        print(f"[skipped] {what} needs vectorbt installed.")
-        return True
-    return False

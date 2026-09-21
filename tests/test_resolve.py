@@ -124,3 +124,24 @@ def test_missing_mode_raises():
 def test_subset_keeps_only_requested_columns():
     universe = load_universe(DICT_SOURCE)
     assert list(universe.subset(["MSFT"]).specs) == ["MSFT"]
+
+
+def test_an_empty_price_frame_names_the_session_alignment_cause():
+    """Regression: this used to die as `IndexError: index 0 is out of bounds for size 0`.
+
+    The IndexError came from `arr.flat[0]` deep in `costs/compose.py`, several frames
+    below anything the caller wrote, and said nothing about the actual problem.
+
+    Real cause, every time: Yahoo timestamps daily bars at each market's LOCAL midnight,
+    so LSE lands on 00:00 UTC and US on 05:00 UTC. Downloading both with
+    `missing_index="drop"` intersects to zero rows while keeping every column, so the
+    frame still looks structurally fine. That is what this message has to explain.
+    """
+    universe = load_universe(DICT_SOURCE)
+    empty = pd.DataFrame(columns=["UKX", "MSFT"], dtype=float)
+    empty.index = pd.DatetimeIndex([], tz="UTC")
+
+    with pytest.raises(UniverseError, match="no rows"):
+        universe.resolve(empty)
+    with pytest.raises(UniverseError, match="timestamped at each market's own midnight"):
+        universe.resolve(empty)

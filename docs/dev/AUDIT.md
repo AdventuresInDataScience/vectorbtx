@@ -10,22 +10,34 @@ No criterion passed on the basis of a symbol merely existing.
 
 ## 1. Plan compliance — 63 criteria from the plan's "Done when" blocks
 
-**59 pass. 0 fail. 4 never implemented as checks.**
+**63 pass. 0 fail. 0 outstanding.**
 
-The four below were written as hardcoded `CANNOT VERIFY` stubs when vectorbt was
-unavailable, and were never filled in once it was. Only the first has since been settled:
+Four were long carried as `CANNOT VERIFY` — hardcoded stubs written when vectorbt was
+unavailable, never filled in once it was. All four are now covered by real tests:
 
-| Section | Criterion | Status |
+| Section | Criterion | Covered by |
 |---|---|---|
-| B | `import vectorbtx` emits no warnings | ✅ **Verified** — 0 warnings on import against vectorbt 1.1.0 |
-| J | `from_weights` reproduces a hand-computed monthly rebalance | ❌ **Still unverified** |
-| J | a cross-currency portfolio rebalances to correct base-currency weights | ❌ **Still unverified** |
-| K2 | Balance and Equity drawdown differ on a portfolio with open positions | ❌ **Still unverified** |
+| B | `import vectorbtx` emits no warnings | verified directly — 0 warnings against vectorbt 1.1.0 |
+| J | `from_weights` reproduces a hand-computed monthly rebalance | `tests/test_from_weights.py` |
+| J | a cross-currency portfolio rebalances to correct base-currency weights | `tests/test_from_weights.py` |
+| K2 | Balance and Equity drawdown differ on a portfolio with open positions | `tests/test_metrics_trades.py` |
 
-⚠️ **`Portfolio.from_weights` has no direct test.** Section J is exercised only
-indirectly, through `vbt.x.PortfolioBacktest` in `tests/test_frontend.py`. The two J
-criteria above are the specific numbers nobody has ever checked. This is the largest
-remaining coverage gap and the obvious next piece of work.
+Until `tests/test_from_weights.py` existed, **`Portfolio.from_weights` had no direct test
+at all** — Section J was exercised only indirectly, through `vbt.x.PortfolioBacktest`.
+
+### ⚠️ Writing the K2 test found a real bug
+
+The criterion was there to catch a specific silent-wrong-number failure, and it did.
+`_per_col` in `metrics/trades/register.py` read `self.values["pnl"]` for **every** trade
+record, open ones included. vectorbt marks an open position's `pnl` to the last price, so
+floating P&L was flowing into `balance_curve` — a function whose entire purpose is to be
+the *closed-only* counterpart to vectorbt's mark-to-market `value()`.
+
+The effect: on a portfolio holding an open position, Balance and Equity drawdown
+converged, which is exactly the distinction MT4/MT5 parity exists to preserve. On the test
+case (one position, never closed, priced 100 → 60 → 90) Balance drawdown reported 0.10
+where it should report 0. `_per_col` now filters to `TradeStatus.Closed`, matching both
+MT's semantics and `balance_curve`'s own docstring.
 
 ### Gaps the audit found and fixed
 
@@ -80,9 +92,9 @@ internally, exported through `vbt.x`, or covered by a test.
 Measured against a real vectorbt 1.1.0 install (numba 0.67.0, numpy 2.5.3, pandas 3.0.6,
 plotly 6.9.0, Python 3.12):
 
-- **245 tests pass, 0 fail, 0 skipped**
-- **60/63 plan criteria verified**; 3 remain unimplemented as checks (all Section J/K2 —
-  see §1)
-- All 12 case files and all 3 strategies run through their harnesses
+- **256 tests pass, 0 fail, 0 skipped** (217 passed / 39 skipped with vectorbt absent)
+- **63/63 plan criteria verified**
+- All 9 numbered examples and all 12 case files run; all 4 strategies run both through the
+  harness **and against live Yahoo + live FRED data**
 - All three numba kernels in `holding/callback.py` compile and pass type inference
 - The agreed v6 API **is implemented**

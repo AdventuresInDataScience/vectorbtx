@@ -89,3 +89,50 @@ def test_carry_and_financing_stay_separate():
     fin = financing_charge(0.0, 0.05, 0.03, True, 1)
     car = carry_charge(100_000, tom_next_differential(0.05, 0.02), 1)
     assert fin == 0.0 and car != 0.0
+
+
+# ############# Rate/price index alignment ############# #
+
+
+def test_a_rate_table_that_does_not_overlap_the_index_is_rejected():
+    """The library's worst failure mode, caught on the way in rather than in the output.
+
+    Yahoo hands back a **tz-aware** index; FRED hands back a **tz-naive** one. Their
+    intersection is empty, so every rate reindexes to NaN and `ffill`/`bfill` have nothing
+    to carry. Nothing downstream notices: NaN rates give NaN carry, a NaN equity curve,
+    and `pf.stats()` that still prints a believable total return with the entire cost
+    model silently contributing zero. Found by running strategy 01 against live data.
+    """
+    from vectorbtx.holding.callback import _rate_for
+
+    tz_aware = pd.date_range("2024-01-01", periods=10, freq="D", tz="UTC")
+    tz_naive = pd.date_range("2024-01-01", periods=10, freq="D")
+    rates = pd.DataFrame({"USD": np.full(10, 0.05)}, index=tz_naive)
+
+    with pytest.raises(ValueError, match="does not overlap"):
+        _rate_for(rates, "USD", tz_aware)
+    # The message must name the actual cause, not just the symptom.
+    with pytest.raises(ValueError, match="tz-aware.*but the rate index is tz-naive"):
+        _rate_for(rates, "USD", tz_aware)
+
+
+def test_a_matching_index_still_resolves_normally():
+    """The guard must not fire on the ordinary case."""
+    from vectorbtx.holding.callback import _rate_for
+
+    idx = pd.date_range("2024-01-01", periods=10, freq="D")
+    rates = pd.DataFrame({"USD": np.full(10, 0.05)}, index=idx)
+    assert _rate_for(rates, "USD", idx).tolist() == pytest.approx([0.05] * 10)
+
+
+def test_a_partially_covering_rate_table_is_filled_not_rejected():
+    """A short rate series is normal — holidays and publication lag. Only *no* overlap
+    is an error."""
+    from vectorbtx.holding.callback import _rate_for
+
+    idx = pd.date_range("2024-01-01", periods=10, freq="D")
+    rates = pd.DataFrame({"USD": [0.05, 0.06]}, index=idx[3:5])
+    out = _rate_for(rates, "USD", idx)
+    assert not np.isnan(out).any()
+    assert out[0] == pytest.approx(0.05)   # bfilled from the first known value
+    assert out[-1] == pytest.approx(0.06)  # ffilled from the last

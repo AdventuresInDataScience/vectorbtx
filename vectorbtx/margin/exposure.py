@@ -102,6 +102,20 @@ def margin_level(pf, universe, group_by=False) -> pd.DataFrame:
     """
     from .requirement import notional as calc_notional
 
+    # ⚠️ Required, not optional. Without this guard a missing universe surfaced as
+    # `TypeError: argument of type 'NoneType' is not iterable` from the `col in universe`
+    # test below — which names neither the argument nor what to do about it.
+    if universe is None:
+        raise ValueError(
+            "margin_level needs a Universe to read per-instrument leverage from, and "
+            "none was given or attached to this portfolio. Portfolios built through "
+            "vbt.x.PortfolioBacktest or Portfolio.from_weights carry theirs "
+            "automatically; one built by calling from_signals/from_orders with "
+            "**universe.resolve(...) does not, because only the resolved Order kwargs "
+            "were passed on and the Universe itself was not. Pass it explicitly, e.g. "
+            "pf.x.min_margin_level(universe=universe)."
+        )
+
     asset_value = pd.DataFrame(pf.asset_value(group_by=group_by))
     value = pd.DataFrame(pf.value(group_by=group_by))
 

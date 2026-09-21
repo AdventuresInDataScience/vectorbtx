@@ -58,6 +58,37 @@ Two things that will bite you on a first install:
 - **Behind a TLS-inspecting proxy, `uv` needs `--native-tls`**, or it fails every fetch with
   `invalid peer certificate: UnknownIssuer`.
 
+### TLS interception and the data providers
+
+Skip this unless downloads fail. Antivirus products that scan HTTPS — Avast, Kaspersky,
+ESET, and most corporate proxies — terminate each TLS connection and re-sign it with their
+own root CA. That CA is installed in the **OS** trust store, so browsers are fine, but
+Python and `curl_cffi` use `certifi`'s bundle, which does not contain it. The symptom is
+misleading: `yfinance` reports `CertificateVerifyError`, then
+`$MSFT: possibly delisted; no price data found`, and hands back an **empty frame** rather
+than raising.
+
+⚠️ `truststore` does **not** fix this for `yfinance`. It patches Python's `ssl`, and
+`yfinance` ≥ 1.7 downloads through `curl_cffi`, which bypasses `ssl` entirely. Point
+curl at a bundle instead:
+
+```bash
+# Build a bundle once: certifi's roots plus the OS trust store.
+python -c "import ssl,certifi,pathlib; \
+p=pathlib.Path.home()/'.certs'/'ca-bundle.pem'; p.parent.mkdir(exist_ok=True); \
+p.write_text(pathlib.Path(certifi.where()).read_text('utf-8')+'\n'+'\n'.join( \
+ssl.DER_cert_to_PEM_cert(d) for s in ('ROOT','CA') for d,_,_ in ssl.enum_certificates(s)),'utf-8'); \
+print(p)"
+
+# Then set these (permanently, via `setx` on Windows or your shell profile):
+export CURL_CA_BUNDLE="$HOME/.certs/ca-bundle.pem"   # curl_cffi -> yfinance
+export SSL_CERT_FILE="$HOME/.certs/ca-bundle.pem"    # Python ssl
+export REQUESTS_CA_BUNDLE="$HOME/.certs/ca-bundle.pem"  # requests -> FRED
+```
+
+Re-run the builder after a `certifi` upgrade or an antivirus reinstall, since both change
+the set of roots.
+
 ---
 
 ## Quick start
@@ -92,7 +123,9 @@ pf = vbt.x.SingleBacktest(
 pf.stats()                      # + Total Net Profit, Recovery Factor, Absolute Drawdown, GHPR
 pf.trades.stats()               # + the full MT4/MT5 trade set
 pf.returns_stats()              # + Ulcer, UPI, M², Treynor, SNR, K-ratio, geometric Sharpe
-pf.x.user_size().iloc[-1]       # "£1.66/pt", not 16600 engine units
+pf.x.user_size().abs().max()    # £1.66/pt — the stake, not 16600 engine units
+                                # (`.iloc[-1]` would be 0.0 here: this strategy is flat
+                                #  on the final bar, and most are.)
 ```
 
 **All four price series are required, passed by keyword, and orders fill at the next bar's
@@ -779,16 +812,20 @@ cd examples/cases      && python _harness.py   # all 12 case files, offline
 cd examples/strategies && python _harness.py   # all 3 strategies, offline
 ```
 
-**245 tests pass against a real vectorbt 1.1.0 install** — vectorbt 1.1.0, numba 0.67.0,
+**256 tests pass against a real vectorbt 1.1.0 install** — vectorbt 1.1.0, numba 0.67.0,
 numpy 2.5.3, pandas 3.0.6, plotly 6.9.0, on Python 3.12 / Windows. No failures, no skips.
-Most are pure NumPy/pandas arithmetic and run without vectorbt at all.
+Most are pure NumPy/pandas arithmetic and run without vectorbt at all: with vectorbt
+uninstalled the suite reports **217 passed, 39 skipped**, which CI enforces as its own job.
+
+All 9 numbered examples, all 12 case files and all 4 strategies run — the strategies
+against **live Yahoo and live FRED data**, not just the offline harness.
 
 **The numba kernels really are compiled.** All three level-3 kernels in
 `holding/callback.py` — `order_func_nb`, `pre_segment_func_nb`, `post_segment_func_nb` —
 acquire numba signatures on first call and survive type inference unchanged. A
 `from_holding_costs` run costs ~8.4s cold (almost entirely compilation) and ~0.02s warm.
 
-Two test files are worth knowing about:
+Three test files are worth knowing about:
 
 - `tests/test_holding_broker.py` — Section G fixtures worked from **broker documentation**
   rather than from the plan, including IG's own published example reproduced to the penny.
@@ -796,14 +833,13 @@ Two test files are worth knowing about:
   of them caught the defects in [`docs/dev/AUDIT-G.md`](docs/dev/AUDIT-G.md).
 - `tests/test_holding_sim.py` — regressions for the four simulation-path defects found by
   actually executing the engine paths.
+- `tests/test_from_weights.py` — Section J against hand-computed share counts, including
+  a cross-currency rebalance driven purely by an FX move. Every expected number is derived
+  in the docstring above it rather than read off the implementation.
 
 Most of the library is pure NumPy/pandas arithmetic and is testable **without vectorbt or
 numba installed** — `tests/conftest.py` detects their absence and imports the package's
 submodules directly. Tests needing a real simulation are marked and skipped.
-
-⚠️ **`Portfolio.from_weights` has no direct test.** Section J is covered only indirectly,
-via `vbt.x.PortfolioBacktest`. See [`docs/dev/AUDIT.md`](docs/dev/AUDIT.md) §1 — it is the
-largest known coverage gap.
 
 The worked numerical examples double as the regression suite: they encode not just "does
 this run" but "does this still produce the number we agreed was correct", which is what

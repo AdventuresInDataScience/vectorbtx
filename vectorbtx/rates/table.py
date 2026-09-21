@@ -30,12 +30,24 @@ DEFAULT_SERIES = {
 }
 
 #: FRED series IDs for the benchmarks above.
+#:
+#: ⚠️ **Verified against the live FRED API, and two of these are not what they look like.**
+#: FRED publishes no daily JPY or CHF overnight benchmark, so `TONA` and `SARON` fall back
+#: to OECD *monthly* "Immediate Rates" series — both of which have been **discontinued**
+#: (last observations 2023-12 and 2024-03). They are the best FRED offers, and they are
+#: forward-filled, so a recent backtest gets a stale constant rather than a measured rate.
+#: `fred._warn_if_coverage_falls_short` says so at download time; for JPY or CHF financing
+#: that actually matters, supply a table through `vbt.x.static_rate_table` instead.
+#:
+#: GBP, USD and EUR are genuine daily overnight benchmarks and are current.
 FRED_SERIES = {
-    "SONIA": "IUDSOIA",
-    "SOFR": "SOFR",
-    "ESTR": "ECBESTRVOLWGTTRMDRT",
-    "TONA": "IRSTCB01JPM156N",
-    "SARON": "IRSTCI01CHM156N",
+    "SONIA": "IUDSOIA",                    # daily, current
+    "SOFR": "SOFR",                        # daily, current
+    # Was "ECBESTRVOLWGTTRMDRT", which FRED answers with "The series does not exist" —
+    # it is missing the "MN". Every EUR-denominated backtest raised HTTP 400.
+    "ESTR": "ECBESTRVOLWGTTRMDMNRT",       # daily, current
+    "TONA": "IRSTCB01JPM156N",             # ⚠️ monthly, discontinued 2023-12
+    "SARON": "IRSTCI01CHM156N",            # ⚠️ monthly, discontinued 2024-03
 }
 
 #: Day-count divisor by the currency the market is **denominated in**.

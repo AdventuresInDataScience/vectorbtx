@@ -90,7 +90,15 @@ def as_fx_table(fx, quote=None, base=None, index=None):
         return FXTable.constant(fx, index)
 
     if hasattr(fx, "get") and not isinstance(fx, (pd.Series, pd.DataFrame)):
+        # ⚠️ `Data.get("Close")` names a SINGLE-symbol result after the field, not after
+        # the symbol — so the one thing needed to infer the pair is dropped exactly here,
+        # and the user sees "Cannot tell which currencies 'Close' refers to" for a
+        # `GBPUSD=X` download that plainly says which. The Data object still knows its
+        # symbol; carry it across. Multi-symbol results already come back symbol-named.
+        symbols = getattr(fx, "symbols", None)
         fx = fx.get("Close")
+        if isinstance(fx, pd.Series) and symbols is not None and len(symbols) == 1:
+            fx = fx.rename(symbols[0])
 
     frame = fx.to_frame() if isinstance(fx, pd.Series) else pd.DataFrame(fx)
     if frame.shape[1] != 1:

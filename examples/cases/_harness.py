@@ -26,6 +26,12 @@ import pandas as pd
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
 
+# The case files print ⚠ and £; a Windows console stdout is cp1252 and cannot encode the
+# first. Without this a case dies mid-output with UnicodeEncodeError. See _bootstrap.py.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):  # pragma: no cover - platform-dependent
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 RNG = np.random.default_rng(20240818)
 _CACHE = {}
 
@@ -71,7 +77,12 @@ class _StubData:
                 "Volume": pd.Series(5e6, index=self.index),
             }[field]
         frame = pd.DataFrame(cols)
-        return frame[self.symbols[0]] if len(self.symbols) == 1 else frame
+        if len(self.symbols) == 1:
+            # ⚠️ Real vectorbt names a single-symbol Series after the FIELD ("Close"),
+            # not after the symbol. See the matching note in strategies/_harness.py —
+            # returning it symbol-named made this stub kinder than reality and hid a bug.
+            return frame[self.symbols[0]].rename(field)
+        return frame
 
 
 class _StubYFData:

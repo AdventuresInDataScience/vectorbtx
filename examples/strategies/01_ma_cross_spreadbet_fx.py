@@ -29,8 +29,28 @@ INIT_CASH = 10_000.0           # £
 # 1. Data
 # ----------------------------------------------------------------------------------
 data = vbt.YFData.download(SYMBOL, start=START, end=END)
-close, open_ = data.get("Close"), data.get("Open")
-high, low = data.get("High"), data.get("Low")
+
+
+def by_date(series):
+    """Two fixes in one, both needed against real Yahoo data.
+
+    `.rename(SYMBOL)` — a SINGLE-symbol `Data.get()` returns a Series named after the
+    FIELD ("Close"), not the symbol; only multi-symbol downloads come back symbol-named.
+    Anything keyed by instrument name, such as the universe, needs the symbol.
+
+    ⚠️ `.tz_localize(None).normalize()` — Yahoo's index is **tz-aware** (UTC) while FRED's
+    is **tz-naive**. Their intersection is empty, so reindexing the rates onto these bars
+    gives NaN everywhere, and carry, financing and the equity curve all quietly become
+    NaN while `pf.stats()` still prints a plausible return. The library now rejects that
+    outright; this is the fix it asks for.
+    """
+    series = series.rename(SYMBOL)
+    series.index = series.index.tz_localize(None).normalize()
+    return series
+
+
+close, open_ = by_date(data.get("Close")), by_date(data.get("Open"))
+high, low = by_date(data.get("High")), by_date(data.get("Low"))
 
 # ESTR for EUR, SOFR for USD. Cached on disk and refreshed on load, so re-running only
 # fetches what is new. Without a FRED key, swap in the static line below.

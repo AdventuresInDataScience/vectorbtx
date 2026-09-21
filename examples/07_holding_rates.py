@@ -10,7 +10,7 @@ Run: python examples/07_holding_rates.py
 import numpy as np
 import pandas as pd
 
-from _bootstrap import HAS_VBT, header, x
+from _bootstrap import header, x
 
 Instrument = x.Instrument
 from vectorbtx.instruments.defaults import financing_basis, triple_day

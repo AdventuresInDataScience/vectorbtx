@@ -17,13 +17,37 @@ class ShadowError(RuntimeError):
     """Raised when vectorbtX would overwrite an existing upstream attribute."""
 
 
+#: Stamped onto everything `attach` sets, so a later collision can tell *whose* attribute
+#: it hit. The patched classes (`ReturnsAccessor`, `Trades`) are upstream's and therefore
+#: shared, so this tag survives even when `vectorbtx` itself has been imported twice —
+#: which is precisely the case the plain `hasattr` check cannot distinguish.
+_ATTACHED_BY_VECTORBTX = "__vectorbtx_attached__"
+
+
 def attach(cls: type, name: str, obj: _t.Any, overwrite: bool = False) -> None:
-    """Set `cls.name = obj`, raising if the name already exists upstream."""
+    """Set `cls.name = obj`, raising if the name is already taken.
+
+    The two ways that happens need different fixes, so they get different messages:
+    upstream grew a method of the same name (rename ours), or vectorbtX attached it
+    already (something re-ran the patching).
+    """
     if not overwrite and hasattr(cls, name):
+        if getattr(getattr(cls, name), _ATTACHED_BY_VECTORBTX, False):
+            raise ShadowError(
+                f"{cls.__name__}.{name} was attached by vectorbtX, not by upstream, so "
+                f"apply_patches() has run twice against the same class. That means the "
+                f"`vectorbtx` package exists as two distinct module objects, each with "
+                f"its own `_APPLIED` flag — check `sys.modules` for more than one "
+                f"spelling. The import name is lowercase `vectorbtx`."
+            )
         raise ShadowError(
             f"{cls.__name__}.{name} already exists upstream — vectorbtX would shadow it. "
             f"Rename the vectorbtX version or remove it."
         )
+    try:
+        setattr(obj, _ATTACHED_BY_VECTORBTX, True)
+    except (AttributeError, TypeError):  # pragma: no cover - slots/builtins
+        pass  # best-effort: without the tag we simply fall back to the upstream message
     setattr(cls, name, obj)
 
 

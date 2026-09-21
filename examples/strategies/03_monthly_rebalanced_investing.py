@@ -43,18 +43,42 @@ print(universe.to_frame())      # eyeball the resolved defaults before trusting 
 # ----------------------------------------------------------------------------------
 # 2. Data, converted to base currency
 # ----------------------------------------------------------------------------------
-data = vbt.YFData.download(list(universe.columns), start=START, end=END,
-                           missing_index="drop")
-fx = vbt.YFData.download("GBPUSD=X", start=START, end=END)
+# ⚠️ This portfolio mixes LSE (VWRL.L, VUSA.L) with US (SPY, AGG) listings, and Yahoo
+# timestamps daily bars at each market's **local** midnight — LSE on 00:00 UTC, US on
+# 05:00 UTC. Those indices never intersect, so `missing_index="drop"` would return
+# **zero rows** with every column still present: nothing looks wrong until it fails.
+# Normalise to calendar dates, then align. `.first()` skips NaN, so the two
+# half-populated rows for a date merge into one complete row.
+data = vbt.YFData.download(list(universe.columns), start=START, end=END)
+
+
+def by_date(frame):
+    frame = frame.copy()
+    frame.index = frame.index.tz_localize(None).normalize()
+    return frame.groupby(level=0).first()
+
+
+fields = {f: by_date(data.get(f)) for f in ("Close", "Open", "High", "Low")}
+# One shared calendar for every field — days on which all four ETFs traded.
+TRADING_DAYS = fields["Close"].dropna(how="any").index
+fields = {f: v.loc[TRADING_DAYS] for f, v in fields.items()}
+
+# `.rename` is needed because a SINGLE-symbol `Data.get()` returns a Series named after
+# the field ("Close"), not the symbol — and the pair name is what identifies the
+# currencies. The rate has to sit on the same calendar as the prices.
+fx = by_date(
+    vbt.YFData.download("GBPUSD=X", start=START, end=END)
+    .get("Close").rename("GBPUSD=X").to_frame()
+)["GBPUSD=X"]
 
 # The universe already knows which columns are USD, so it supplies the currencies.
-price = vbt.x.to_base_currency(data.get("Close"), base=BASE, fx=fx,
+price = vbt.x.to_base_currency(fields["Close"], base=BASE, fx=fx,
                                instruments=universe, fx_markup=0.005)
-open_price = vbt.x.to_base_currency(data.get("Open"), base=BASE, fx=fx,
+open_price = vbt.x.to_base_currency(fields["Open"], base=BASE, fx=fx,
                                     instruments=universe, fx_markup=0.005)
-high = vbt.x.to_base_currency(data.get("High"), base=BASE, fx=fx,
+high = vbt.x.to_base_currency(fields["High"], base=BASE, fx=fx,
                               instruments=universe, fx_markup=0.005)
-low = vbt.x.to_base_currency(data.get("Low"), base=BASE, fx=fx,
+low = vbt.x.to_base_currency(fields["Low"], base=BASE, fx=fx,
                              instruments=universe, fx_markup=0.005)
 
 # ----------------------------------------------------------------------------------

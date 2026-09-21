@@ -5,6 +5,7 @@ on: [push, pull_request]
 jobs:
   pinned:
     # Must pass. Mirrors upstream's matrix.
+    name: pytest (pinned)
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -16,7 +17,61 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install "vectorbt==1.1.0" -e ".[dev]"
+      - run: pip install -e ".[dev]"
+      - run: pytest -q
+
+  examples:
+    # The examples are the regression suite for "does this still produce the number we
+    # agreed was correct". They are NOT covered by pytest, and both defects found during
+    # the first real-vectorbt run lived here rather than in tests/ — a Windows-only
+    # UnicodeDecodeError that silently failed 6 of the 12 case files, and a matching
+    # encode error that killed 03_modes_quantize.py.
+    #
+    # ⚠️ Windows is the point of this job. Both bugs were cp1252 console-encoding faults
+    # that no Linux runner can reproduce.
+    name: examples (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - name: numbered examples
+        shell: bash
+        run: |
+          cd examples
+          for f in 0*.py; do echo "--- $f"; python "$f" > /dev/null; done
+      - name: case files
+        shell: bash
+        run: cd examples/cases && python _harness.py
+      - name: strategies
+        shell: bash
+        run: cd examples/strategies && python _harness.py
+
+  no-vectorbt:
+    # Design goal §1.4: the pure-arithmetic layer imports and tests standalone. That is a
+    # real, working feature — measured at 213 passed / 39 skipped — and it had nothing
+    # protecting it, so a stray top-level `import vectorbt` would have silently ended it.
+    # A failure here means a module that should be pure has grown an engine dependency;
+    # tests that need a simulation must SKIP, not error.
+    name: pure-arithmetic layer (no vectorbt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install without the engine
+        run: |
+          pip install --no-deps -e .
+          pip install "numpy>=2.4.6" "pandas>=3.0.3,<4.0" scipy pytest
+      - name: vectorbt really is absent
+        run: python -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('vectorbt') is None else 'vectorbt is installed; this job proves nothing')"
       - run: pytest -q
 
   floating:
@@ -24,6 +79,7 @@ jobs:
     # It watches for changes to portfolio/nb.py callback internals (§5.5 item 1) and for
     # name collisions from patching (item 5). A red canary is information, not an
     # emergency — read it, do not panic.
+    name: floating vectorbt (canary)
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:

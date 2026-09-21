@@ -272,7 +272,35 @@ def _rate_for(rates, currency, index):
             f"No benchmark rate for {currency!r}. Section M must be loaded and cover the "
             f"backtest period. Present: {list(frame.columns)}"
         )
-    return frame[currency].reindex(index).ffill().bfill().to_numpy(dtype=float)
+    aligned = frame[currency].reindex(index).ffill().bfill()
+
+    # ⚠️ All-NaN here is the library's worst failure mode, because nothing downstream
+    # complains: NaN rates give NaN financing and carry, which give a NaN equity curve,
+    # and `pf.stats()` still prints a plausible-looking total return while the cost model
+    # has contributed exactly nothing.
+    #
+    # It has one overwhelmingly common cause. Yahoo returns a **tz-aware** index (UTC);
+    # FRED returns a **tz-naive** one. Their intersection is empty, so every bar reindexes
+    # to NaN, and `ffill`/`bfill` cannot help because there is no value anywhere to carry.
+    if len(aligned) and bool(aligned.isna().all()):
+        idx_tz = getattr(index, "tz", None)
+        rate_tz = getattr(frame.index, "tz", None)
+        hint = ""
+        if (idx_tz is None) != (rate_tz is None):
+            hint = (
+                f" The price index is {'tz-aware (' + str(idx_tz) + ')' if idx_tz is not None else 'tz-naive'} "
+                f"but the rate index is {'tz-aware (' + str(rate_tz) + ')' if rate_tz is not None else 'tz-naive'}, "
+                f"so they share no timestamps at all — this is the usual cause. Normalise "
+                f"one to match the other, e.g. "
+                f"`price.index = price.index.tz_localize(None).normalize()`."
+            )
+        raise ValueError(
+            f"The {currency!r} rate series does not overlap the backtest index, so every "
+            f"rate resolves to NaN and all financing and carry would silently be NaN."
+            f"{hint} Rate range: {frame.index.min()} to {frame.index.max()}; backtest "
+            f"range: {index.min()} to {index.max()}."
+        )
+    return aligned.to_numpy(dtype=float)
 
 
 # ############# Order-argument materialisation ############# #

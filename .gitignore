@@ -3,6 +3,12 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+
+# Local secrets. Not a supported config mechanism — the library only ever reads
+# os.environ / an explicit api_key=; how that gets set is the user's choice. Ignored
+# purely so a local test .env cannot be committed by accident.
+.env
+.env.*
 *.egg-info/
 build/
 dist/
