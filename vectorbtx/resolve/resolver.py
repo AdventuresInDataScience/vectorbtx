@@ -88,21 +88,33 @@ def resolve_universe(
     # to surface — `IndexError: index 0 is out of bounds for size 0` from `arr.flat[0]`
     # deep inside `costs/compose.py`, which tells the reader nothing.
     #
-    # In practice this means one thing: a multi-exchange download whose sessions never
-    # aligned. Yahoo stamps daily bars at LOCAL midnight, so LSE bars land on 00:00 UTC
-    # and US bars on 05:00 UTC; `missing_index="drop"` then intersects to *nothing*, with
-    # all the columns still present so nothing else looks wrong.
+    # Two quite different faults land here, and the column count tells them apart. With
+    # several columns it is nearly always session misalignment. With one, nothing was
+    # downloaded at all — and blaming misalignment there sends the reader hunting for a
+    # timezone bug that does not exist.
     if len(price.index) == 0:
         from .load import UniverseError  # local: load.py imports this module
 
+        if len(columns) == 1:
+            cause = (
+                "With a single column, the download itself returned nothing. Check the "
+                "ticker is one the provider actually knows — Yahoo logs 'possibly "
+                "delisted; no price data found' and hands back an empty frame rather "
+                "than raising, so a wrong symbol looks like a library fault. Index "
+                "names are not tickers: the FTSE 100 is '^FTSE', not 'UKX'."
+            )
+        else:
+            cause = (
+                "With several columns, the usual cause is aligning instruments from "
+                "different exchanges: Yahoo timestamps daily bars at each market's own "
+                "midnight (LSE 00:00 UTC, US 05:00 UTC), so an index intersection is "
+                "empty even though every series has data. Normalise to dates before "
+                "aligning — `frame.index = frame.index.tz_localize(None).normalize()` "
+                "on each source, then combine."
+            )
         raise UniverseError(
             f"The price data has {len(columns)} column(s) but no rows, so nothing can be "
-            f"resolved. The usual cause is aligning instruments from different exchanges: "
-            f"daily bars are timestamped at each market's own midnight (LSE at 00:00 UTC, "
-            f"US at 05:00 UTC), so an index intersection is empty even though both series "
-            f"have data. Normalise the timestamps to dates before aligning — e.g. "
-            f"`frame.index = frame.index.tz_localize(None).normalize()` on each source, "
-            f"then combine. Columns seen: {list(columns)}."
+            f"resolved. {cause} Columns seen: {list(columns)}."
         )
 
     out: dict = {}

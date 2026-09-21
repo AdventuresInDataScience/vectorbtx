@@ -143,5 +143,26 @@ def test_an_empty_price_frame_names_the_session_alignment_cause():
 
     with pytest.raises(UniverseError, match="no rows"):
         universe.resolve(empty)
-    with pytest.raises(UniverseError, match="timestamped at each market's own midnight"):
+    with pytest.raises(UniverseError, match="each market's own midnight"):
         universe.resolve(empty)
+
+
+def test_a_single_empty_column_blames_the_download_not_the_timezones():
+    """One column cannot be a *misalignment* — there is nothing to misalign against.
+
+    Found by running `examples/cases/A_cfd_single.py` live: its ticker "UKX" is not a
+    Yahoo symbol (the FTSE 100 is "^FTSE"), Yahoo returned an empty frame, and the
+    message above confidently blamed cross-exchange session times. A wrong-but-confident
+    diagnosis is worse than a vague one.
+    """
+    universe = load_universe(DICT_SOURCE).subset(["UKX"])
+    empty = pd.DataFrame(columns=["UKX"], dtype=float)
+    empty.index = pd.DatetimeIndex([], tz="UTC")
+
+    with pytest.raises(UniverseError, match="the download itself returned nothing"):
+        universe.resolve(empty)
+    # ...and it must NOT repeat the multi-exchange story here.
+    try:
+        universe.resolve(empty)
+    except UniverseError as exc:
+        assert "different exchanges" not in str(exc)
