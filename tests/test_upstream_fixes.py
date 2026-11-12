@@ -644,3 +644,112 @@ def test_selection_across_accounts_raises_and_groups_still_select():
     assert list(pf[0].wrapper.columns) == ["A", "B"]           # a group label, as upstream
     with pytest.raises(KeyError):
         pf["Z"]
+
+
+# ############# Stop-adjustment callbacks on split bars (Studio issue 14) ############# #
+
+if HAS_VECTORBT:
+    from numba import njit
+
+    @njit
+    def _count_calls_sl_nb(c, calls):
+        """Count calls per bar while in a position. The last slot counts any `c.i` that is
+        not a bar index — guarded, because numba does not bounds-check."""
+        if c.position_now != 0:
+            if 0 <= c.i < calls.shape[0] - 1:
+                calls[c.i] += 1.0
+            else:
+                calls[calls.shape[0] - 1] += 1.0
+        return c.curr_stop, c.curr_trail
+
+    @njit
+    def _time_stop_sl_nb(c, bars):
+        """After `bars` bars in a position, move the stop to the entry price; an open below
+        it exits there, at the open."""
+        if c.position_now != 0 and c.i - c.init_i >= bars:
+            return 0.0, False
+        return c.curr_stop, c.curr_trail
+
+    @njit
+    def _reads_an_array_sl_nb(c, values):
+        return c.curr_stop, c.curr_trail
+
+
+def _narrow_random_bars(n=300, columns=("A", "B")):
+    """Bars too narrow for any entry bar to reach a 3% stop."""
+    rng = np.random.default_rng(21)
+    index = pd.bdate_range("2023-01-02", periods=n)
+    c = pd.DataFrame(100 * np.exp(np.cumsum(rng.normal(0, 0.01, (n, len(columns))), axis=0)),
+                     index=index, columns=list(columns))
+    o = c.shift(1).fillna(c)
+    h, l = np.maximum(o, c) * 1.002, np.minimum(o, c) * 0.998
+    entries = pd.DataFrame(rng.random(c.shape) < 0.05, index=index, columns=list(columns))
+    return o, h, l, c, entries
+
+
+def _whole_bars(o, h, l, c, entries, stop_fraction, **callback):
+    """The same strategy on whole bars, straight through vectorbt."""
+    from vectorbtx.core.portfolio import Portfolio
+    from vectorbtx.frontend.backtest import _next_bar
+
+    return Portfolio.from_signals(c, entries=_next_bar(entries, c), exits=_next_bar(mask(c.index, c.columns), c),
+                                  size=10, open=o, high=h, low=l, price=o, sl_stop=stop_fraction,
+                                  stop_entry_price="price", stop_exit_price="stopmarket",
+                                  init_cash=10_000, freq="D", **callback)
+
+
+def test_a_stop_adjusting_callback_still_checks_the_entry_bar():
+    """Studio issue 14: a callback used to rule out split bars, so the entry bar's range
+    went unchecked. Bar 1 opens at 100 and trades to 97 against a 2-point stop."""
+    o, h, l, c = frames([100] * 6, [101] * 6, [99, 97, 99, 99, 99, 99])
+    calls = np.zeros(len(c) + 1)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        pf = run(o, h, l, c, entries=mask(c.index, ["X"], [("X", 0)]), exits=mask(c.index, ["X"]),
+                 instruments={"X": EQUITY}, size=1, stop_points=2, init_cash=10_000,
+                 adjust_sl_func_nb=_count_calls_sl_nb, adjust_sl_args=(calls,))
+    assert _orders(pf) == [(1, "Buy", 100.0), (1, "Sell", 98.0)]
+    assert not any("NOT checked" in str(w.message) for w in caught)
+    assert calls[-1] == 0                      # never handed a step index
+
+
+def test_callbacks_are_called_exactly_as_on_whole_bars():
+    """Once per bar, at the open, with bar indices: the same calls on the same bars as a
+    whole-bar run, and the same orders when no entry bar reaches its stop."""
+    o, h, l, c, entries = _narrow_random_bars()
+    split_calls = np.zeros((len(c) + 1))
+    whole_calls = np.zeros((len(c) + 1))
+    split = run(o, h, l, c, entries=entries, exits=mask(c.index, c.columns),
+                instruments={k: EQUITY for k in c.columns}, size=10, stop_points=3.0,
+                init_cash=10_000, adjust_sl_func_nb=_count_calls_sl_nb, adjust_sl_args=(split_calls,))
+    whole = _whole_bars(o, h, l, c, entries, 3.0 / o,
+                        adjust_sl_func_nb=_count_calls_sl_nb, adjust_sl_args=(whole_calls,))
+    assert split_calls[-1] == 0
+    assert split_calls.sum() > 50
+    assert split_calls.tolist() == whole_calls.tolist()
+    assert sorted(_orders(split)) == sorted(_orders(whole))
+
+
+def test_a_time_stop_callback_exits_at_the_open_as_on_whole_bars():
+    """Bar counting (`c.i - c.init_i`) and the exit at the open behave as on whole bars."""
+    o, h, l, c = frames([100, 100, 99.5, 99, 98.5, 98, 97.5, 97, 96.5, 96],
+                        [100.2, 100.2, 99.7, 99.2, 98.7, 98.2, 97.7, 97.2, 96.7, 96.2],
+                        [99.8, 99.8, 99.3, 98.8, 98.3, 97.8, 97.3, 96.8, 96.3, 95.8])
+    entries = mask(c.index, ["X"], [("X", 0)])
+    split = run(o, h, l, c, entries=entries, exits=mask(c.index, ["X"]), instruments={"X": EQUITY},
+                size=10, stop_points=20, init_cash=10_000,
+                adjust_sl_func_nb=_time_stop_sl_nb, adjust_sl_args=(3,))
+    whole = _whole_bars(o, h, l, c, entries, 20.0 / o, adjust_sl_func_nb=_time_stop_sl_nb, adjust_sl_args=(3,))
+    # Entered at bar 1; three bars later the stop moves to the entry, and bar 4 opens below it.
+    assert _orders(split) == _orders(whole) == [(1, "Buy", 100.0), (4, "Sell", 98.5)]
+
+
+def test_templated_callback_arguments_fall_back_with_a_warning():
+    """Templates are filled from the two-step arrays, which a bar view cannot index."""
+    import vectorbtx as vbt
+
+    o, h, l, c = frames([100] * 6, [101] * 6, [99] * 6)
+    with pytest.warns(UserWarning, match="NOT checked on the bar a position is entered"):
+        run(o, h, l, c, entries=mask(c.index, ["X"], [("X", 0)]), exits=mask(c.index, ["X"]),
+            instruments={"X": EQUITY}, size=1, stop_points=2, init_cash=10_000,
+            adjust_sl_func_nb=_reads_an_array_sl_nb, adjust_sl_args=(vbt.Rep("high"),))

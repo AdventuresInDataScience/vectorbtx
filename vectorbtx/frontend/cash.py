@@ -32,7 +32,8 @@ them — it was freed at the open. A stop hit intrabar fires on the rest-of-bar 
 every entry, so its cash never funds an entry at an open it came after. Neither bias, in
 either direction.
 
-Without split bars (a custom numba callback rules them out) a column's intrabar stop and
+Without split bars (a custom `signal_func_nb` or templated callback arguments rule them
+out) a column's intrabar stop and
 its bar's entries share one step, so columns with no signal are ordered after the
 entries: the intrabar stop cannot fund them, at the cost of a gap stop's cash waiting a bar.
 """

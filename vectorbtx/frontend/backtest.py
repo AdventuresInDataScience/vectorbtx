@@ -371,10 +371,12 @@ def PortfolioBacktest(
         if split and not can_split(sim_kwargs):
             split = False
             warnings.warn(
-                "A custom signal or stop-adjustment callback was given, so bars cannot be "
-                "split into the open and the rest of the bar, and stops are NOT checked on "
-                "the bar a position is entered: a stop the entry bar trades through is "
-                "missed. That flatters the result, most for tight stops on daily bars.",
+                "A custom signal_func_nb, or templates in a stop-adjustment callback's "
+                "arguments, were given, so bars cannot be split into the open and the rest "
+                "of the bar, and stops are NOT checked on the bar a position is entered: a "
+                "stop the entry bar trades through is missed. That flatters the result, "
+                "most for tight stops on daily bars. Pass the arrays a callback needs as "
+                "plain per-bar arrays instead of templates to avoid it.",
                 stacklevel=2,
             )
         if cash == "shared" and "call_seq" not in sim_kwargs:

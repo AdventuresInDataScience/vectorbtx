@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### ⚠️ Changes results
+
+- **Stops are checked on the entry bar with stop-adjustment callbacks too** (OpenStrategy
+  Studio issue 14). A custom `adjust_sl_func_nb` or `adjust_tp_func_nb` used to rule out
+  split bars, so with one the entry bar's range went unchecked (with a warning). Each
+  callback is now wrapped in a bar view: it is called exactly as on whole bars — once per
+  bar, at the open, with `c.i`, `c.init_i` and `c.curr_i` as bar indices and its own
+  arguments untouched — so existing callbacks work unchanged and the entry bar is checked.
+  Only a custom `signal_func_nb`, or templates in a callback's arguments, still fall back
+  to whole bars, with the warning.
+
+## 16293a2
+
 Fixes for the issues OpenStrategy Studio's phase 0 found in the front door. Most of them
 produced **plausible wrong numbers with no error**, so expect saved results to move.
 

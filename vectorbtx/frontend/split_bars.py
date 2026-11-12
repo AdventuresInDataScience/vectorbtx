@@ -34,6 +34,12 @@ Two further consequences, both towards realism:
 Only used when a stop or target is active: without one, a whole-bar simulation is already
 exact and the split would only double the work.
 
+**Stop-adjustment callbacks** (`adjust_sl_func_nb`, `adjust_tp_func_nb`) work unchanged:
+each is wrapped so it sees bars, not steps, and is called exactly as on whole bars — once
+per bar, at the open, before that bar's stops are checked (see `bar_view`). A custom
+`signal_func_nb`, or templates in a callback's arguments, cannot be split; the front door
+falls back to whole bars for those and warns.
+
 Entries fill on the open step, whose close is the open, so every `stop_entry_price` anchor
 except `"fillprice"` resolves to the open there. The front door's default, `"price"`, is
 the open anyway; an explicit `"close"` no longer reaches past the fill to the bar's close.
@@ -47,8 +53,78 @@ import pandas as pd
 #: The signal arrays: placed on the open step, absent from the rest of the bar.
 SIGNAL_ARGS = ("entries", "exits", "short_entries", "short_exits")
 
-#: Callbacks whose arguments are opaque, so they cannot be expanded to the split index.
-CALLBACK_ARGS = ("signal_func_nb", "adjust_sl_func_nb", "adjust_tp_func_nb")
+#: Stop-adjustment callbacks, with their argument keyword and the context they receive.
+ADJUST_CALLBACKS = {
+    "adjust_sl_func_nb": ("adjust_sl_args", "sl"),
+    "adjust_tp_func_nb": ("adjust_tp_args", "tp"),
+}
+
+
+# ############# Callbacks on split bars ############# #
+#
+# ⚠️ A stop-adjustment callback is written for whole bars: it indexes its own per-bar
+# arrays with `c.i` and counts bars as `c.i - c.init_i`. Handed the split index
+# unchanged, `c.i` runs to twice the number of bars, so it reads the wrong bar, and
+# because numba does not bounds-check it WRITES PAST THE END of its own arrays and
+# corrupts the heap (found while building this: the process died later, elsewhere).
+#
+# So each callback is wrapped in a bar view. The wrapper calls it only on a bar's OPEN
+# step, with `i`, `init_i` and `curr_i` divided back to bars, and on the rest of the bar
+# returns the stop unchanged. The callback therefore sees exactly the calls whole bars
+# made — once per bar, at the open, before any of that bar's stops are checked, with
+# bar indices — and its arguments pass through untouched. Only the stop check gains the
+# rest of the entry bar.
+#
+# The wrapper is generated per callback with the callback as a module GLOBAL, which numba
+# treats as a compile-time constant. A closure over it crashed numba's compiler, and
+# passing it inside the argument tuple works but goes through numba's experimental
+# first-class function types (and warns). Generated once per process per callback.
+
+_BAR_VIEW_SOURCE = {
+    "sl": '''
+def bar_view(c{args}):
+    if c.i % 2 == 1:
+        return c.curr_stop, c.curr_trail
+    bar = AdjustSLContext(
+        i=c.i // 2, col=c.col, position_now=c.position_now, val_price_now=c.val_price_now,
+        init_i=to_bar(c.init_i), init_price=c.init_price, curr_i=to_bar(c.curr_i),
+        curr_price=c.curr_price, curr_stop=c.curr_stop, curr_trail=c.curr_trail,
+    )
+    return user_func(bar{args})
+''',
+    "tp": '''
+def bar_view(c{args}):
+    if c.i % 2 == 1:
+        return c.curr_stop
+    bar = AdjustTPContext(
+        i=c.i // 2, col=c.col, position_now=c.position_now, val_price_now=c.val_price_now,
+        init_i=to_bar(c.init_i), init_price=c.init_price, curr_stop=c.curr_stop,
+    )
+    return user_func(bar{args})
+''',
+}
+
+_bar_views = {}
+
+
+def bar_view(kind, user_func, n_args):
+    """The bar-view wrapper of one stop-adjustment callback (see the note above)."""
+    key = (kind, user_func, n_args)
+    if key not in _bar_views:
+        from numba import njit
+        from vectorbt.portfolio.enums import AdjustSLContext, AdjustTPContext
+
+        @njit
+        def to_bar(i):
+            # -1 means "no position" or "never updated"; it stays -1.
+            return i // 2 if i >= 0 else i
+
+        names = "".join(f", a{k}" for k in range(n_args))
+        namespace = {"AdjustSLContext": AdjustSLContext, "AdjustTPContext": AdjustTPContext,
+                     "to_bar": to_bar, "user_func": user_func}
+        exec(_BAR_VIEW_SOURCE[kind].format(args=names), namespace)
+        _bar_views[key] = njit(namespace["bar_view"])
+    return _bar_views[key]
 
 
 def stops_active(stops, sim_kwargs) -> bool:
@@ -65,18 +141,33 @@ def stops_active(stops, sim_kwargs) -> bool:
     return False
 
 
-def can_split(sim_kwargs) -> bool:
-    """False when a custom numba callback is given: its arguments cannot be re-indexed.
-
-    vectorbt's own no-op defaults, passed explicitly, are not custom and do not count.
-    """
+def _custom(func):
+    """True for a callback that is not one of vectorbt's own no-op defaults."""
     from vectorbt.portfolio import nb
 
-    defaults = {nb.no_signal_func_nb, nb.no_adjust_sl_func_nb, nb.no_adjust_tp_func_nb}
-    return not any(
-        sim_kwargs.get(name) is not None and sim_kwargs.get(name) not in defaults
-        for name in CALLBACK_ARGS
+    return func is not None and func not in (
+        nb.no_signal_func_nb, nb.no_adjust_sl_func_nb, nb.no_adjust_tp_func_nb
     )
+
+
+def can_split(sim_kwargs) -> bool:
+    """False for the two cases a bar view cannot cover; stop-adjustment callbacks are fine.
+
+    * A custom `signal_func_nb` generates the signals itself, step by step, so it would
+      also fire on the rest of the bar. (It also bypasses the front door's next-open
+      shift, so it is a lookahead risk in its own right.)
+    * Templates (`vbt.Rep(...)` and friends) in a callback's arguments are filled from the
+      broadcast inputs — on split bars, the two-step arrays — which the bar view would
+      then index by bar.
+    """
+    from vectorbt.utils.template import has_templates
+
+    if _custom(sim_kwargs.get("signal_func_nb")):
+        return False
+    for name, (args_name, _) in ADJUST_CALLBACKS.items():
+        if _custom(sim_kwargs.get(name)) and has_templates(sim_kwargs.get(args_name, ())):
+            return False
+    return True
 
 
 def simulate_split_bars(cls, close, open, high, low, price, signals, call_seq=None, **kwargs):
@@ -141,6 +232,19 @@ def simulate_split_bars(cls, close, open, high, low, price, signals, call_seq=No
     if call_seq is not None:
         kwargs["call_seq"] = call_seq
 
+    # Stop-adjustment callbacks see bars, not steps; their own arguments stay per bar, so
+    # they are taken out of `kwargs` before the per-bar values are repeated.
+    callbacks = {}
+    for name, (args_name, kind) in ADJUST_CALLBACKS.items():
+        func = kwargs.pop(name, None)
+        user_args = tuple(kwargs.pop(args_name, ()))
+        if _custom(func):
+            callbacks[name] = bar_view(kind, func, len(user_args))
+            callbacks[args_name] = user_args
+        elif func is not None:
+            callbacks[name] = func
+            callbacks[args_name] = user_args
+
     open_ = open.to_numpy(dtype=float)
     split = cls.from_signals(
         two(open_, close.to_numpy(dtype=float)),
@@ -152,6 +256,7 @@ def simulate_split_bars(cls, close, open, high, low, price, signals, call_seq=No
         # close is the bar's last.
         price=two(price.to_numpy(dtype=float), close.to_numpy(dtype=float)),
         **{k: repeat(v) for k, v in kwargs.items()},
+        **callbacks,
     )
 
     orders = split.order_records.copy()

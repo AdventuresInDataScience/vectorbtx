@@ -153,8 +153,16 @@ hold an entry and its stop-out, and a position closed the same day holds nothing
 Two smaller consequences, both towards realism: an exit signal at the open beats an
 intrabar stop on the same bar (whole bars let the stop win, at the stop price), and when
 a stop and a target are both in a bar's range the stop still wins. With no stop active
-nothing changes. A custom `adjust_sl_func_nb` / `adjust_tp_func_nb` / `signal_func_nb`
-cannot be split, so it falls back to whole bars with a warning.
+nothing changes.
+
+A custom `adjust_sl_func_nb` / `adjust_tp_func_nb` works unchanged on split bars. It is
+wrapped so that it is called exactly as on whole bars — once per bar, at the open, before
+that bar's stops are checked — with `c.i`, `c.init_i` and `c.curr_i` as **bar** indices,
+and its own arguments passed through untouched, so it keeps indexing its per-bar arrays by
+`c.i`. Write it as you would for whole bars; only the stop check gains the rest of the
+entry bar. Two cases cannot be split and fall back to whole bars with a warning: a custom
+`signal_func_nb`, and templates (`vbt.Rep(...)`) in a callback's arguments — pass those
+arrays directly instead.
 
 **Cash — an account per instrument, or one shared account.**
 
