@@ -50,17 +50,22 @@ Start here. `SingleBacktest` and `PortfolioBacktest` are a facade over sections 
 pf = vbt.x.PortfolioBacktest(close=close, open=open_, high=high, low=low, ...)
 ```
 
-Orders fill at the **next bar's open**: entries, exits and rebalance dates shift one bar, and
-`price=open`. Stops are checked against `high` and `low`. There is no `execution=` argument
-and no default for the extremes — filling at the signal close is lookahead, checking a stop
-against the close fires it late, and an API that offers a broken mode invites its use.
+Orders fill at the **next bar's open**: entries, exits, short entries, short exits and
+rebalance dates all shift one bar, and `price=open`. Pass signals unshifted — shifting them
+yourself as well delays them two bars. Stops are checked against `high` and `low`. There is
+no `execution=` argument and no default for the extremes — filling at the signal close is
+lookahead, checking a stop against the close fires it late, and an API that offers a broken
+mode invites its use.
 
 Keyword-only is deliberate. Four same-shaped frames in positional sequence is precisely the
 call where transposing two of them — high and low swapped, open where close belongs — runs
 cleanly and reports a wrong number. Naming them makes that mistake unspellable.
 
 `pf.x.intrabar_drawdown()` measures the worst peak-to-trough decline against the highs and
-lows rather than the closes.
+lows rather than the closes. Each side is bracketed by its own extremes (a long is worst at
+the low, a short at the high), and shared cash is counted once.
+`pf.x.intrabar_drawdown_series()` is the per-bar curve, for plotting beside `pf.drawdown()`;
+`pf.x.intrabar_value()` gives the best and worst account value inside each bar.
 
 Everything order-time — sizes, stop distances, spread fractions — is priced at the **open
 you fill at**, not the close the signal fired on.
@@ -94,10 +99,21 @@ Contradicting the convention warns.
 
 | Given | Route |
 |---|---|
-| `entries` / `exits` | `from_signals` |
+| `entries` / `exits` / `short_entries` / `short_exits` | `from_signals` |
 | `weights` / `schedule` | `from_weights` |
-| neither | `from_holding` |
+| neither, with a size | `from_orders` — the size on the first bar, funded at buying power |
+| neither, no size | `from_holding` — all-in, **funded at equity** |
 | both | **error naming the conflict** |
+
+An unsized hold buys with all the cash it has, so it is funded at the account's own equity:
+handing it buying power would hold `leverage` times the account. A small account may then
+not reach an instrument's minimum size (£10,000 cannot buy £1/pt of EURUSD at 1x); the
+backtest warns when a hold places no order.
+
+Weights whose longs need more cash than the account holds are **scaled down pro rata** on
+those bars, with a warning, so 0.75 / 0.75 becomes 0.50 / 0.50 rather than the first column
+filling in full and the last being starved. Without `lock_cash` a short's proceeds count as
+cash (the constraint is the net long weight); with it, the gross weight.
 
 **Sizing — exactly one.** Two given raises, naming both.
 
@@ -114,6 +130,78 @@ known before the simulation runs. Material over a long backtest with real drawdo
 
 **Stops in points**, converted internally to the native price fractions:
 `stop_points`, `target_points`, `trail_points`. Native `sl_stop` etc. are still accepted.
+
+Stops are anchored at the **fill**, not the entry bar's close: the front door sets
+`stop_entry_price="price"` (the order price before slippage, which is what the points were
+converted against), so a 2-point stop on a buy filled at 100 sits at 98 whatever the bar
+closed at. Trailing stops start from the same anchor. A stop or target exit **pays the
+spread and slippage** like any other fill (`stop_exit_price="stopmarket"`); vectorbt's
+default exits stops with no slippage, and the spread lives in `slippage`. A take-profit is a
+limit order, so strictly it should pay the spread but not slippage — one `slippage` field
+cannot separate them, so it pays both. Pass either argument to override it.
+
+⚠️ **Stops are checked on the bar a position is entered.** vectorbt places one order per
+column per bar and checks stops before signals, so on whole bars a position entered at
+bar `t`'s open has its stops checked from `t+1`, and a stop the entry bar trades through
+is simply missed — an optimistic bias that is worst for tight stops on daily bars. With
+any stop or target active, the front door simulates each bar as two steps: the **open**
+(O = H = L = C = open), where signals fill and a stop that gaps through fires, and the
+**rest of the bar** (the real range, no signals), where every stop is checked — including
+one set at this bar's open. Orders are mapped back onto the original bars, so one bar can
+hold an entry and its stop-out, and a position closed the same day holds nothing overnight.
+
+Two smaller consequences, both towards realism: an exit signal at the open beats an
+intrabar stop on the same bar (whole bars let the stop win, at the stop price), and when
+a stop and a target are both in a bar's range the stop still wins. With no stop active
+nothing changes. A custom `adjust_sl_func_nb` / `adjust_tp_func_nb` / `signal_func_nb`
+cannot be split, so it falls back to whole bars with a warning.
+
+**Cash — an account per instrument, or one shared account.**
+
+```python
+cash="per_instrument"   # each column trades its own copy of init_cash (the default for signals)
+cash="shared"           # one account across every column (cash_sharing=True, group_by=True)
+
+entry_priority=None             # shared only: who is filled first when entries compete
+entry_priority=["D", "C"]       #   a static order; unlisted columns follow, in column order
+entry_priority=scores           #   a DataFrame of per-bar scores, higher first, aligned with
+                                #   the signals (the bar the signal is computed on)
+entry_priority="random"         #   a seeded permutation each bar; give seed=
+
+when_cash_short="skip"          # the default under shared cash: an order the cash cannot
+when_cash_short="partial"       # cover is not placed / is filled as far as the cash goes
+```
+
+Priority decides only **between entries**. On each bar the orders that close or reduce a
+position go first, so their cash is available, then entries in priority order, then
+everything else. A score frame is shifted with the signals, so a score from bar `t`'s close
+ranks the entry that fills at bar `t+1`'s open. `when_cash_short` maps to vectorbt's
+`allow_partial`; outside shared cash it defaults to vectorbt's partial fill, as before.
+
+Stops are timed as well as ordered. A stop that gaps through at the open fires on the open
+step, before the entries, so its cash funds them; a stop hit intrabar fires on the
+rest-of-bar step, after every entry, so it cannot fund an entry at an open it came after.
+`cash="shared"` with no `entry_priority` still orders closing orders first; pass
+`call_seq=` yourself to replace that entirely.
+
+**Selecting instruments inside a shared account.** `pf["A"]` is A's **contribution** to the
+account: the account's starting equity, A's trades and holding costs only. Its
+`total_profit` is A's P&L and its `total_return` that P&L over the account's equity, so the
+columns add up to the account exactly — and agree with `pf.total_return(group_by=False)`.
+`pf[["A", "B"]]` is the two together, still sharing the equity. It replays the orders the
+account placed; it is not a re-simulation of A with an account to itself. A selection
+spanning two cash-sharing groups raises `AccountSelectionError`; a group label selects the
+group, as in vectorbt.
+
+**Currencies.** `account_currency=` names the account's currency. A flat `base_currency=`
+next to instrument terms describing an FX underlying (`asset_class="fx"` or
+`mode="fx_spot"`) is the **pair's** base currency, the leg carry needs — so
+`base_currency="EUR", quote_currency="USD"` describes EURUSD. Anywhere else a flat
+`base_currency` is still the account currency, as before.
+
+`fx_markup=` is the broker's conversion markup, charged as slippage on every fill of a
+converted column. It defaults to the markup carried by prices from `to_base_currency`;
+columns already quoted in the account currency pay none.
 
 **Instruments — four supply forms**, all producing an identical `Universe`:
 
@@ -456,7 +544,9 @@ denominator. Deriving guarantees `value(A,B) × value(B,A) = 1` by construction.
 | `.validate(tolerance=1e-4)` | reciprocal and triangulation checks; warns beyond a basis point |
 | `.currencies` | every currency in the grid |
 
-### `vbt.x.to_base_currency(data, base, fx_table, fx_markup=0.005, fill_policy="ffill_with_warning", quote_currency=None)` → `ConvertedFrame`
+### `vbt.x.to_base_currency(data, base, fx_table, fx_markup=None, fill_policy="ffill_with_warning", quote_currency=None)` → `ConvertedFrame`
+
+`fx_markup=None` reads `settings["vectorbtx"]["fx_markup"]` (0.5% unless changed).
 
 Converts OHLC using **one rate per bar**. Different rates for open, high, low and close
 would break `H ≥ C ≥ L`, and native SL/TP would fire at prices that never existed — the
@@ -468,7 +558,8 @@ Also reachable as `df.vbt.x.to_base_currency(...)`.
 Returns a `ConvertedFrame` carrying:
 
 - `.native` — the original series, retained for decomposition
-- `.fx_markup` — picked up by the cost layer and added to `slippage`
+- `.fx_markup` — read off `open` by the front door and added to `slippage` on every fill
+  of a converted column (a converted Series carries it in `.attrs` instead)
 - `.decompose()` — splits total return into asset return and FX return
 
 `fx_markup` models the broker's worse-than-market conversion rate. It is applied as

@@ -39,6 +39,7 @@ def resolve_costs(
     size=None,
     notional=None,
     base_currency=None,
+    fx_markup=None,
 ) -> dict:
     """Compose every active cost module into `Order` keyword arguments.
 
@@ -52,6 +53,10 @@ def resolve_costs(
         size: order sizes, needed by per-unit commission and auto slippage.
         notional: order notionals, needed by minimum commission.
         base_currency: the account currency.
+        fx_markup: the FX conversion markup, a fraction added to `slippage`. A scalar
+            applies to every column; a `dict[column, markup]` applies per column (the
+            front door builds one so that columns already in the account currency, which
+            were never converted, pay none). None falls back to `price.fx_markup`.
 
     Returns:
         `{"fees": ..., "fixed_fees": ..., "slippage": ...}`, each a scalar or a
@@ -68,7 +73,10 @@ def resolve_costs(
         {'fees': 0.001, 'fixed_fees': 0.0, 'slippage': [...]}
     """
     # Read the markup before coercion: pd.DataFrame(...) drops ConvertedFrame's attribute.
-    fx_markup = getattr(price, "fx_markup", None)
+    if fx_markup is None:
+        from ..fx.convert import fx_markup_of
+
+        fx_markup = fx_markup_of(price)
     price = pd.DataFrame(price)
     columns = list(columns) if columns is not None else list(price.columns)
     specs = universe.order_for(columns)
@@ -102,10 +110,11 @@ def resolve_costs(
                 # Spread and slippage share one field — sum, never overwrite.
                 slip = slip + _as_column_value(part["slippage"], len(price))
 
-        if fx_markup:
+        markup = fx_markup.get(col) if isinstance(fx_markup, dict) else fx_markup
+        if markup:
             # The FX markup is a spread on the exchange rate, so it behaves exactly like a
             # spread on price: adverse on entry and adverse again on exit.
-            slip = slip + float(fx_markup)
+            slip = slip + float(markup)
 
         fees.append(_scalarise(fee))
         fixed_fees.append(_scalarise(fixed))

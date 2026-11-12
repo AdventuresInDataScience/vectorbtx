@@ -130,11 +130,13 @@ pf.x.user_size().abs().max()    # £1.66/pt — the stake, not 16600 engine unit
 
 **All four price series are required, passed by keyword, and orders fill at the next bar's
 open.** A signal
-from bar `t`'s close is acted on when bar `t+1` opens, so entries, exits and rebalance dates
-shift one bar and fill at `open`; sizes, stop distances and spread fractions are priced at
-that open. Stops are checked against `high` and `low`, and `pf.x.intrabar_drawdown()`
-measures the worst moment against them — routinely a third worse than the close-to-close
-figure. None of these has a default, because every available default flatters the result — and they
+from bar `t`'s close is acted on when bar `t+1` opens, so entries, exits, short entries,
+short exits and rebalance dates shift one bar and fill at `open`; sizes, stop distances and
+spread fractions are priced at that open. Stops are anchored at the fill and checked against
+`high` and `low` — on the entry bar too, since each bar is simulated as its open plus the
+rest of the bar — a stop or target exit pays the spread like any other fill, and
+`pf.x.intrabar_drawdown()` measures the worst moment against the extremes — routinely a
+third worse than the close-to-close figure. None of these has a default, because every available default flatters the result — and they
 are keyword-only, because four same-shaped frames in a row is exactly where a silent
 transposition produces a plausible wrong answer instead of an error.
 
@@ -146,6 +148,22 @@ product rather than a typo.
 **Multi-instrument** is the same call with `vbt.x.PortfolioBacktest`, and instruments can
 be supplied four ways — flat keywords, per-symbol overrides on a shared base, a CSV/Excel
 path, or `Instrument` objects. All four produce an identical `Universe`.
+
+**One account or several.** By default each instrument in a signal portfolio trades its
+own copy of `init_cash`, so three symbols on £10,000 trade £30,000. `cash="shared"` makes it
+one account, and `entry_priority=` decides who is filled first when entries compete for its
+cash — a list of symbols, a per-bar score frame, or `"random"` with a `seed`. Exits are
+always processed first, so the cash they free is there for that bar's entries; an entry the
+cash cannot cover is skipped (`when_cash_short="skip"`) or partially filled (`"partial"`).
+`pf["A"]` on a shared account is A's contribution to it, so the instruments add up to the
+account.
+
+```python
+pf = vbt.x.PortfolioBacktest(close=close, open=open_, high=high, low=low,
+                             entries=entries, exits=exits, instruments=book,
+                             risk_pct=0.01, stop_points=50, init_cash=10_000,
+                             cash="shared", entry_priority=momentum, freq="D")
+```
 
 **The layer underneath is still public.** `universe.resolve(close)` returns the `Order`
 kwargs, and `Portfolio.from_orders`/`from_signals`/`from_weights` take them directly — use
@@ -351,7 +369,7 @@ design, so `vbt.x.<tab>` is a complete inventory of the extras surface.
 #### `core/accessors.py`
 | Symbol | Does | Calls | Called by |
 |---|---|---|---|
-| `PortfolioXAccessor` | `pf.x` — portfolio-bound extras. Methods: `universe`, `borrowed_portion`, `margin_level`, `min_margin_level`, `drift`, `holding_costs`. | `margin.exposure.*` | `core.portfolio.Portfolio.x` |
+| `PortfolioXAccessor` | `pf.x` — portfolio-bound extras. Methods: `universe`, `borrowed_portion`, `margin_level`, `min_margin_level`, `drift`, `holding_costs`, `user_size`, `unit_names`, `intrabar_value`, `intrabar_drawdown_series`, `intrabar_drawdown`. | `margin.exposure.*` | `core.portfolio.Portfolio.x` |
 | `_XAccessorBase` | `df.vbt.x` — data-bound extras: `to_base_currency`, `to_returns_metrics`. | `fx.convert.to_base_currency` | registered accessors |
 | `register_accessors()` | Registers `x` on `Vbt_SRAccessor` / `Vbt_DFAccessor`, guarding against collision. | vbt `register_*_vbt_accessor`, `ShadowError` | `apply_patches` |
 
@@ -812,10 +830,10 @@ cd examples/cases      && python _harness.py   # all 12 case files, offline
 cd examples/strategies && python _harness.py   # all 3 strategies, offline
 ```
 
-**256 tests pass against a real vectorbt 1.1.0 install** — vectorbt 1.1.0, numba 0.67.0,
+**308 tests pass against a real vectorbt 1.1.0 install** — vectorbt 1.1.0, numba 0.67.0,
 numpy 2.5.3, pandas 3.0.6, plotly 6.9.0, on Python 3.12 / Windows. No failures, no skips.
 Most are pure NumPy/pandas arithmetic and run without vectorbt at all: with vectorbt
-uninstalled the suite reports **217 passed, 39 skipped**, which CI enforces as its own job.
+uninstalled the suite reports **218 passed, 90 skipped**, which CI enforces as its own job.
 
 All 9 numbered examples, all 12 case files and all 4 strategies run — the strategies
 against **live Yahoo and live FRED data**, not just the offline harness.

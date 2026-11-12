@@ -214,17 +214,21 @@ def _build_spec(kwargs: dict, column) -> Instrument:
 # ############# 2. Strategy type ############# #
 
 
-def strategy_of(entries=None, exits=None, weights=None, schedule=None) -> str:
+def strategy_of(entries=None, exits=None, weights=None, schedule=None,
+                short_entries=None, short_exits=None) -> str:
     """Infer the strategy type from which arguments are present.
 
-    `entries`/`exits` → signal-driven. `weights`/`schedule` → rebalanced. Neither → hold.
-    Both → an error naming the conflict, because there is no sensible merge of the two.
+    `entries`/`exits`/`short_entries`/`short_exits` → signal-driven. `weights`/`schedule` →
+    rebalanced. Neither → hold. Both → an error naming the conflict, because there is no
+    sensible merge of the two.
     """
-    has_signals = entries is not None or exits is not None
+    has_signals = any(
+        s is not None for s in (entries, exits, short_entries, short_exits)
+    )
     has_weights = weights is not None or schedule is not None
     if has_signals and has_weights:
         raise BacktestError(
-            "Both signal arguments (entries/exits) and rebalancing arguments "
+            "Both signal arguments (entries/exits/short_entries/short_exits) and rebalancing arguments "
             "(weights/schedule) were given. A backtest is one or the other: signals "
             "enter and exit positions, weights hold continuously and periodically "
             "adjust. Drop one set."
@@ -521,19 +525,32 @@ def prepare(
     exits=None,
     weights=None,
     schedule=None,
+    short_entries=None,
+    short_exits=None,
     # sizing
     risk_pct=None, risk_amount=None, stake=None, notional=None, size=None,
     # stops
     stop_points=None, target_points=None, trail_points=None,
     # data
     volume=None, rates=None, fx=None, base_currency=None,
+    fx_markup=None, fx_markup_currency=None,
     # account
     init_cash=None,
+    allow_partial=True,
     # everything else
     spec_kwargs=None,
     passthrough=None,
 ):
     """Run the whole front-door pipeline and return everything a constructor needs.
+
+    Args:
+        base_currency: the ACCOUNT currency (the front door's `account_currency`).
+        fx_markup: the FX conversion markup, a fraction. Charged as slippage on every
+            column except those already quoted in the account currency.
+        fx_markup_currency: the currency the prices were converted into, used to tell
+            which columns were converted when `base_currency` is not given.
+        allow_partial: whether a cash-short order is partially filled (True) or skipped
+            (False). Only changes what the cash-constraint warning says.
 
     Returns:
         dict with `universe`, `strategy`, `columns`, `price`, `size`, `order_kwargs`,
@@ -560,7 +577,7 @@ def prepare(
     fx = as_fx_table(fx, index=price.index)
 
     universe = to_universe(instruments, columns=columns, **spec_kwargs)
-    strategy = strategy_of(entries, exits, weights, schedule)
+    strategy = strategy_of(entries, exits, weights, schedule, short_entries, short_exits)
 
     # Fail on a spec/price mismatch before doing any work, in both directions.
     universe.order_for(columns)
@@ -582,6 +599,10 @@ def prepare(
         volume=volume,
         size=engine_size,
         notional=_notional_of(engine_size, fill, weights, init_cash, columns),
+        fx_markup=per_column_fx_markup(
+            universe, columns, fx_markup,
+            base_currency if base_currency is not None else fx_markup_currency,
+        ),
     )
     if engine_size is not None:
         # Sizes are already quantized above, so the engine must not floor them again —
@@ -594,7 +615,8 @@ def prepare(
         stop_points=stop_points, target_points=target_points, trail_points=trail_points,
     )
 
-    warn_if_cash_constrained(universe, engine_size, fill, columns, init_cash)
+    warn_if_cash_constrained(universe, engine_size, fill, columns, init_cash,
+                             partial=allow_partial)
 
     return dict(
         universe=universe,
@@ -608,7 +630,27 @@ def prepare(
     )
 
 
-def warn_if_cash_constrained(universe, engine_size, price, columns, init_cash) -> None:
+def per_column_fx_markup(universe, columns, fx_markup, account_currency=None):
+    """The FX conversion markup for each column, or None when there is none.
+
+    Only a column that was actually converted pays it. One already quoted in the account
+    currency was multiplied by a rate of 1 and crossed no exchange, so charging it the
+    markup would over-cost every domestic holding in a mixed book. When either currency is
+    unknown the column is charged: over-costing is the safer error.
+    """
+    if fx_markup is None:
+        return None
+    markup = float(fx_markup)
+    out = {}
+    for col in columns:
+        quote = universe[col].quote_currency
+        domestic = account_currency is not None and quote is not None and quote == account_currency
+        out[col] = 0.0 if domestic else markup
+    return out
+
+
+def warn_if_cash_constrained(universe, engine_size, price, columns, init_cash,
+                             partial=True) -> None:
     """Warn when a position exceeds even the **levered** buying power.
 
     Leverage is funded, not merely capped — `vectorbtx.margin.buying_power` hands the
@@ -646,6 +688,15 @@ def warn_if_cash_constrained(universe, engine_size, price, columns, init_cash) -
         f"{c} needs {want:,.0f} but its leverage funds only {power:,.0f}"
         for c, (want, power) in offenders.items()
     )
+    if not partial:
+        warnings.warn(
+            f"Sized positions exceed their funded buying power ({detail}; equity="
+            f"{np.asarray(init_cash, dtype=float).sum():,.0f} total). With "
+            f"when_cash_short='skip' these orders are NOT PLACED AT ALL, so the backtest "
+            f"will run with fewer trades than signals. Raise `leverage` or reduce the size.",
+            stacklevel=3,
+        )
+        return
     warnings.warn(
         f"Sized positions exceed their funded buying power ({detail}; equity="
         f"{np.asarray(init_cash, dtype=float).sum():,.0f} total). These orders will be "

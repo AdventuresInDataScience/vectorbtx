@@ -16,6 +16,10 @@ from vectorbt.portfolio.base import Portfolio as _Portfolio
 from .accessors import PortfolioXAccessor
 
 
+class AccountSelectionError(ValueError):
+    """Raised when a column selection spans more than one cash-sharing account."""
+
+
 class Portfolio(_Portfolio):
     """Drop-in replacement for `vectorbt.portfolio.base.Portfolio`.
 
@@ -123,7 +127,7 @@ class Portfolio(_Portfolio):
         from vectorbt.portfolio import dispatch
         from vectorbt.utils.config import merge_dicts
 
-        loan = np.asarray(loan, dtype=float)
+        loan = np.atleast_1d(np.asarray(loan, dtype=float))
         if self.wrapper.grouper.is_grouped(group_by=group_by):
             group_lens = self.wrapper.grouper.get_group_lens(group_by=group_by)
             adj = dispatch.init_cash_grouped(loan, group_lens, self.cash_sharing, engine=engine)
@@ -195,8 +199,98 @@ class Portfolio(_Portfolio):
 
         Upstream slices each of its own fields explicitly; anything we add must be sliced
         here too or it silently desynchronises from the columns it describes.
+
+        On a grouped, cash-sharing portfolio upstream selects **groups**, so `pf["A"]`
+        failed for an instrument inside a shared account. A key that names no group but
+        does name columns now selects those columns' contribution to their account — see
+        `_select_within_account`. A key naming a group selects the group, as upstream.
         """
-        new_pf = _Portfolio.indexing_func(self, pd_indexing_func, **kwargs)
+        try:
+            new_pf = _Portfolio.indexing_func(self, pd_indexing_func, **kwargs)
+        except Exception as upstream_error:
+            if not (self.cash_sharing and self.wrapper.grouper.is_grouped()):
+                raise
+            try:
+                return self._select_within_account(pd_indexing_func, **kwargs)
+            except AccountSelectionError:
+                raise
+            except Exception as column_error:
+                # Neither a group nor a column. The column lookup's error (a KeyError
+                # naming the key) says more than upstream's "already contains one column".
+                raise column_error from upstream_error
+
+        # The loan shares `init_cash`'s basis, so it must be sliced by the same indices —
+        # groups under cash sharing, columns otherwise. Slicing it by the wrong axis would
+        # leave a portfolio reporting equity for columns it no longer holds.
+        margin_loan = self._margin_loan
+        if margin_loan is not None:
+            _, _, group_idxs, col_idxs = self.wrapper.indexing_func_meta(
+                pd_indexing_func, column_only_select=True, **kwargs
+            )
+            idxs = group_idxs if self.cash_sharing else col_idxs
+            # ⚠️ `pf["A"]` selects with a scalar index, which leaves a 0-d array here, and
+            # upstream's `init_cash_grouped_nb` needs 1-D: every metric on a levered
+            # portfolio then died with a numba TypingError while `pf[["A"]]` worked.
+            margin_loan = np.atleast_1d(np.asarray(margin_loan, dtype=float)[idxs])
+        return self._slice_extras(new_pf, margin_loan)
+
+    def _select_within_account(self, pd_indexing_func, **kwargs):
+        """Columns of a shared account, as their contribution to that account.
+
+        A column inside a shared account has no cash of its own, so "its" portfolio needs
+        a definition. This one is the column's **contribution**: the account's starting
+        equity, only the selected columns' orders and holding costs, and therefore
+        `total_profit` equal to their P&L and `total_return` equal to that P&L over the
+        account's equity. Contributions add up: summed over every column they give the
+        account's profit and return exactly. It is also what upstream's own ungrouped
+        figures mean under cash sharing (`pf.total_return(group_by=False)`), so the two
+        agree.
+
+        What it is not: a re-simulation. The orders are the ones the shared account
+        actually placed, constrained by its cash — not what the column would have done
+        with an account to itself.
+
+        Raises:
+            AccountSelectionError: if the selection spans more than one cash-sharing
+                account.
+        """
+        from vectorbt.base.reshape_fns import to_2d_array
+
+        ungrouped = self.wrapper.regroup(False)
+        new_wrapper, _, _, col_idxs = ungrouped.indexing_func_meta(
+            pd_indexing_func, column_only_select=True, **kwargs
+        )
+        col_idxs = np.atleast_1d(np.asarray(col_idxs))
+        groups = np.asarray(self.wrapper.grouper.get_groups())[col_idxs]
+        if len(np.unique(groups)) > 1:
+            raise AccountSelectionError(
+                "This selection spans more than one cash-sharing account, so there is no "
+                "single account for it to be a contribution to. Select columns of one "
+                "account at a time, or select the groups themselves."
+            )
+        equity = np.atleast_1d(np.asarray(self.get_init_cash(), dtype=float))[groups[0]]
+
+        # Several columns of one account still share its cash; one column is its own.
+        shared = len(col_idxs) > 1
+        if shared:
+            # `replace`, not `regroup`: the ungrouped wrapper refuses to enable grouping.
+            new_wrapper = new_wrapper.replace(group_by=True)
+        new_pf = self.replace(
+            wrapper=new_wrapper,
+            close=new_wrapper.wrap(to_2d_array(self.close)[:, col_idxs], group_by=False),
+            order_records=self.orders.get_by_col_idxs(col_idxs),
+            log_records=self.logs.get_by_col_idxs(col_idxs),
+            init_cash=np.array([equity], dtype=float),
+            cash_sharing=shared,
+            # The account's call order ranks every column; it means nothing for a subset.
+            call_seq=None,
+            # `equity` already has the loan taken out, so the slice carries none.
+            margin_loan=None,
+        )
+        return self._slice_extras(new_pf, margin_loan=None)
+
+    def _slice_extras(self, new_pf, margin_loan):
+        """Carry the vectorbtX state, and the already-sliced loan, to a column selection."""
         cols = list(new_pf.wrapper.columns)
 
         universe = self._universe
@@ -208,17 +302,6 @@ class Portfolio(_Portfolio):
                 keep = [c for c in cols if c in obj.columns]
                 return obj[keep]
             return obj
-
-        # The loan shares `init_cash`'s basis, so it must be sliced by the same indices —
-        # groups under cash sharing, columns otherwise. Slicing it by the wrong axis would
-        # leave a portfolio reporting equity for columns it no longer holds.
-        margin_loan = self._margin_loan
-        if margin_loan is not None:
-            _, _, group_idxs, col_idxs = self.wrapper.indexing_func_meta(
-                pd_indexing_func, column_only_select=True, **kwargs
-            )
-            idxs = group_idxs if self.cash_sharing else col_idxs
-            margin_loan = np.asarray(margin_loan, dtype=float)[idxs]
 
         return new_pf.replace(
             universe=universe,

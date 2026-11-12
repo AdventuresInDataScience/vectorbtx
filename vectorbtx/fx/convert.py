@@ -138,7 +138,7 @@ def to_base_currency(
     fx_table=None,
     quote_currency=None,
     instruments=None,
-    fx_markup: float = 0.005,
+    fx_markup=None,
     fill_policy: str = "ffill_with_warning",
     validate: bool = True,
     fx=None,
@@ -155,14 +155,18 @@ def to_base_currency(
         instruments: a `Universe`, a `dict[column, Instrument]`, or a `dict[column, str]`.
             An alternative to `quote_currency`: the universe already knows which columns
             are foreign, so restating it invites the two to disagree.
-        fx_markup: the broker's worse-than-market conversion rate, default 0.5%. Returned
-            on `.fx_markup` for Section E to apply as slippage — see Notes.
+        fx_markup: the broker's worse-than-market conversion rate. None (the default)
+            reads `settings["vectorbtx"]["fx_markup"]` (0.5% unless changed). Returned on
+            `.fx_markup`, which the front door reads off the `open` frame and charges as
+            slippage on every fill of a converted column — see Notes.
         fill_policy: how to align the rate series to the price index.
         validate: check that OHLC ordering survives conversion.
         fx: alias for `fx_table`, matching the front door's argument name.
 
     Returns:
-        `ConvertedFrame` (or `pd.Series`) with `.native`, `.fx_rate` and `.fx_markup`.
+        `ConvertedFrame` with `.native`, `.fx_rate`, `.fx_markup` and `.base_currency`.
+        A Series input returns a `pd.Series`, which carries `fx_markup` and
+        `base_currency` in its `.attrs` instead.
 
     Notes:
         **Quote-currency information arrives in one shape.** `quote_currency` and
@@ -191,6 +195,11 @@ def to_base_currency(
     """
     if hasattr(data, "get") and not isinstance(data, (pd.Series, pd.DataFrame)):
         data = data.get()
+
+    if fx_markup is None:
+        from ..core.settings import get
+
+        fx_markup = get("fx_markup", 0.005)
 
     is_series = isinstance(data, pd.Series)
     frame = data.to_frame() if is_series else pd.DataFrame(data)
@@ -227,10 +236,48 @@ def to_base_currency(
         check_ohlc_ordering(out)
 
     if is_series:
-        series = out.iloc[:, 0]
-        series.name = data.name
+        series = pd.Series(out.iloc[:, 0].to_numpy(), index=frame.index, name=data.name)
+        # A plain Series has nowhere to keep ConvertedFrame's attributes, and dropping the
+        # markup here meant a converted single-instrument backtest never paid it.
+        series.attrs["fx_markup"] = out.fx_markup
+        series.attrs["base_currency"] = base
         return series
     return out
+
+
+def fx_markup_of(*frames):
+    """The FX conversion markup a converted price frame carries, or None.
+
+    Reads `ConvertedFrame.fx_markup`, or the `attrs` entry a converted Series carries,
+    from the first frame that has one. Must be called **before** the frame is coerced
+    with `pd.DataFrame(...)`, which drops both.
+    """
+    for frame in frames:
+        if frame is None:
+            continue
+        # isinstance, not getattr: on a plain frame, attribute access would find a
+        # column that happened to be called `fx_markup`.
+        if isinstance(frame, ConvertedFrame):
+            markup = getattr(frame, "fx_markup", None)
+        else:
+            markup = getattr(frame, "attrs", {}).get("fx_markup")
+        if markup is not None:
+            return float(markup)
+    return None
+
+
+def converted_currency_of(*frames):
+    """The base currency a converted price frame was converted into, or None."""
+    for frame in frames:
+        if frame is None:
+            continue
+        if isinstance(frame, ConvertedFrame):
+            currency = getattr(frame, "base_currency", None)
+        else:
+            currency = getattr(frame, "attrs", {}).get("base_currency")
+        if currency is not None:
+            return currency
+    return None
 
 
 def _quote_map(columns, quote_currency, instruments) -> dict:

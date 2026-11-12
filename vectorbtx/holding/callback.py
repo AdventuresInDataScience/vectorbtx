@@ -196,6 +196,7 @@ def build_charges(
     idx = pd.Index(index)
     cols = list(columns) if columns is not None else list(universe.columns)
     charges = pd.DataFrame(0.0, index=idx, columns=cols)
+    no_pair = []
 
     for col in cols:
         if col not in universe:
@@ -228,6 +229,14 @@ def build_charges(
             )
 
         if "carry" in spec.active_costs and notional is not None:
+            # ⚠️ Carry is a differential, so it needs BOTH legs of the pair. A missing leg
+            # used to be priced at 0% by `_rate_for`, so an FX instrument with no
+            # `base_currency` paid (or earned) the whole quote-currency rate, while the
+            # construction warning said carry would resolve to zero. Skip it instead, as
+            # that warning promises, and say so again here, where it bites.
+            if spec.base_currency is None or spec.quote_currency is None:
+                no_pair.append(col)
+                continue
             n = np.abs(_col_series(notional, col, len(idx)))
             base_rate = _rate_for(rates, spec.base_currency, idx)
             quote_rate = _rate_for(rates, spec.quote_currency, idx)
@@ -237,6 +246,16 @@ def build_charges(
                 carry_series(n, base_rate, quote_rate, mult, carry_markup, False, day_count),
             )
 
+    if no_pair and rates is not None:
+        import warnings
+
+        warnings.warn(
+            f"Carry skipped for {no_pair}: carry is active but the instrument does not "
+            f"name both currencies of its pair (base_currency and quote_currency), so the "
+            f"tom-next differential cannot be computed. These columns are charged NO "
+            f"carry, which is also wrong. Set both currencies on the instrument.",
+            stacklevel=3,
+        )
     return charges
 
 
@@ -398,7 +417,7 @@ def simulate_with_holding_costs(
     universe,
     rates=None,
     markup=None,
-    carry_markup: float = 0.0,
+    carry_markup=None,
     holidays=None,
     order_kwargs=None,
     **kwargs,
@@ -417,7 +436,8 @@ def simulate_with_holding_costs(
         universe: the `Universe`.
         rates: benchmark rate table from Section M.
         markup: broker financing markup. Defaults to `settings["vectorbtx"]`.
-        carry_markup: markup on the carry differential.
+        carry_markup: markup on the carry differential. None (the default) reads
+            `settings["vectorbtx"]["carry_markup"]`; pass 0.0 to charge none.
         holidays: dates carrying no charge.
         order_kwargs: explicit `Order` field overrides, merged over the universe's.
         **kwargs: simulation arguments (`init_cash`, `cash_sharing`, `group_by`, `freq`,

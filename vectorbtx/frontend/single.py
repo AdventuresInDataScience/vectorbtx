@@ -23,6 +23,8 @@ _PORTFOLIO_ONLY = {
     "leverage_budget": "portfolio-level leverage needs a portfolio",
     "cash_sharing": "there is only one column to share cash between",
     "group_by": "there is only one column to group",
+    "cash": "there is only one column, so per-instrument and shared cash are the same account",
+    "entry_priority": "with one column no entries compete for cash",
 }
 
 
@@ -31,6 +33,11 @@ def SingleBacktest(*, close=None, open=None, high=None, low=None, **kwargs):
 
     Takes every argument `PortfolioBacktest` does except the portfolio-only ones, which
     raise with a pointer to the other class.
+
+    On an FX instrument (`asset_class="fx"` or `mode="fx_spot"`), `base_currency` is the
+    pair's base currency, so `base_currency="EUR", quote_currency="USD"` describes EURUSD
+    and carry is the EUR/USD differential. Name the account's currency with
+    `account_currency=`.
 
     Args:
         close: a 1-D close series, or a single-column frame.
@@ -69,6 +76,13 @@ def SingleBacktest(*, close=None, open=None, high=None, low=None, **kwargs):
             "`close` is required. All four price series are passed by keyword:\n"
             "  vbt.x.SingleBacktest(close=..., open=..., high=..., low=..., ...)"
         )
+    # A converted Series carries its FX markup in `.attrs`; read it before reshaping, so it
+    # survives whatever the reshaping does to them.
+    if kwargs.get("fx_markup") is None:
+        from ..fx.convert import fx_markup_of
+
+        kwargs["fx_markup"] = fx_markup_of(open, close)
+
     frame = close.to_frame() if isinstance(close, pd.Series) else pd.DataFrame(close)
     def _align(series):
         if series is None:

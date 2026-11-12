@@ -60,8 +60,59 @@ class PortfolioXAccessor:
         """Quantization drift recorded at construction, or None."""
         return getattr(self._pf, "_drift", None)
 
-    def intrabar_drawdown(self):
-        """Maximum drawdown measured against intrabar **lows**, not closes.
+    def intrabar_value(self) -> pd.DataFrame:
+        """The account's best and worst value inside each bar.
+
+        Returns:
+            DataFrame with columns `best` and `worst`, one row per bar: the whole
+            account's value with every position at its most favourable extreme, and at
+            its least favourable one. Summed over every column, so a portfolio of
+            separate per-instrument pools reports their total.
+
+        Notes:
+            **Each side is bracketed by its own extremes.** A long is best at the high and
+            worst at the low; a short is the other way round. Valuing every position at
+            the low for the trough would report a spike against a short as a *gain*.
+
+            ⚠️ **Cash is read at the portfolio's own grouping, never per column.** Under
+            cash sharing, `pf.cash(group_by=False)` hands every column the group's whole
+            starting cash, so summing it counts the shared pot once per column. That
+            inflated the denominator and reported a drawdown *shallower* than the
+            close-to-close one. `pf.cash()` reconciles exactly with `pf.value()`: it
+            counts shared cash once, nets out the margin loan and includes holding costs.
+        """
+        if self._pf.low is None or self._pf.high is None:
+            raise ValueError(
+                "No intrabar highs/lows on this portfolio. Build it through "
+                "vbt.x.PortfolioBacktest, which requires them."
+            )
+        assets = pd.DataFrame(self._pf.assets())
+        cash = pd.DataFrame(self._pf.cash()).sum(axis=1)
+        close = pd.DataFrame(self._pf.close).reindex(columns=assets.columns)
+        # A missing extreme falls back to the close rather than valuing a held position
+        # at zero, which would manufacture a drawdown.
+        highs = pd.DataFrame(self._pf.high).reindex(columns=assets.columns).fillna(close)
+        lows = pd.DataFrame(self._pf.low).reindex(columns=assets.columns).fillna(close)
+
+        longs, shorts = assets.clip(lower=0.0), assets.clip(upper=0.0)
+        best = (longs * highs + shorts * lows).sum(axis=1) + cash
+        worst = (longs * lows + shorts * highs).sum(axis=1) + cash
+        return pd.DataFrame({"best": best, "worst": worst})
+
+    def intrabar_drawdown_series(self) -> pd.Series:
+        """Drawdown at each bar, measured against the intrabar extremes.
+
+        Returns:
+            Series of positive fractions, one per bar: how far the bar's worst value sits
+            below the best value seen so far. Its maximum is `intrabar_drawdown()`; this
+            is the curve to plot beside `pf.drawdown()`.
+        """
+        values = self.intrabar_value()
+        peak = values["best"].cummax()
+        return (1.0 - values["worst"] / peak).rename("intrabar_drawdown")
+
+    def intrabar_drawdown(self) -> float:
+        """Maximum drawdown measured against intrabar extremes, not closes.
 
         The standard figure values the portfolio at each bar's close, so an excursion that
         happened and recovered within the bar is invisible to it. On daily data that
@@ -72,34 +123,18 @@ class PortfolioXAccessor:
             Float, the maximum peak-to-trough decline as a positive fraction.
 
         Notes:
-            ⚠️ The **peak is taken from the highs and the trough from the lows**. Valuing
-            both ends at the low would depress the running peak by the same amount as the
-            trough and report a drawdown *smaller* than the close-to-close figure — the
-            opposite of the intent.
+            ⚠️ The **peak is taken from each bar's best value and the trough from its
+            worst** (see `intrabar_value`). Valuing both ends at the same extreme would
+            move the running peak by as much as the trough and report a drawdown
+            *smaller* than the close-to-close figure — the opposite of the intent.
 
             This is the pessimistic bracket: it assumes every position hit its best
             simultaneously, then its worst simultaneously. The realised figure lies between
             this and `pf.max_drawdown()`, and the gap between them measures how much
-            intrabar risk a strategy is carrying.
-
-            Long-only is the assumption. A short position is hurt by the **high**, so for a
-            short book the two series should be swapped; this reads the long case, which is
-            what the mandatory `high`/`low` are principally there to protect.
+            intrabar risk a strategy is carrying. Longs and shorts are each bracketed by
+            their own side, so the figure holds for long, short and mixed books.
         """
-        if self._pf.low is None or self._pf.high is None:
-            raise ValueError(
-                "No intrabar highs/lows on this portfolio. Build it through "
-                "vbt.x.PortfolioBacktest, which requires them."
-            )
-        assets = pd.DataFrame(self._pf.assets())
-        cash = pd.DataFrame(self._pf.cash(group_by=False)).sum(axis=1)
-        highs = pd.DataFrame(self._pf.high).reindex(columns=assets.columns)
-        lows = pd.DataFrame(self._pf.low).reindex(columns=assets.columns)
-
-        best = (assets * highs).sum(axis=1) + cash
-        worst = (assets * lows).sum(axis=1) + cash
-        peak = best.cummax()
-        return float((1.0 - worst / peak).max())
+        return float(self.intrabar_drawdown_series().max())
 
     def user_size(self, universe=None):
         """Position size in the units the user actually trades in, not engine units.

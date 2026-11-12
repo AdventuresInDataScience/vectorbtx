@@ -45,7 +45,9 @@ def day_multipliers(index, triple_day: str = "WED", end_of_day: str = "22:00", h
     if target is None:
         raise ValueError(f"Unknown triple_day {triple_day!r}. Expected one of {sorted(WEEKDAYS)}.")
 
-    weekday = idx.weekday.to_numpy() if hasattr(idx.weekday, "to_numpy") else np.asarray(idx.weekday)
+    # `day_of_week`, not its deprecated alias, which pandas 4 removes. Same numbering:
+    # Monday is 0.
+    weekday = np.asarray(idx.day_of_week, dtype=np.int64)
     mult = np.ones(len(idx), dtype=float)
     mult[weekday >= 5] = 0.0
     mult[weekday == target] = triple_multiplier
