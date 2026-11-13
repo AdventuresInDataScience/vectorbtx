@@ -2099,8 +2099,12 @@ unbuilt.
   pre-tax comparison. In the UK a spread bet and the equivalent share position differ by
   0.5% per entry before any P&L is considered, so a user comparing modes must apply that
   themselves.
-- **Short share borrow charge is not modelled** — G6. Short share CFD strategies look
-  cheaper here than in reality; the rate is instrument-specific and not freely available.
+- **Short borrow charge: direct shorts only, from a user-supplied rate** — G6, resolved
+  after v1. It follows how the instrument is traded: a direct (`equity`) short borrows the
+  security and pays `Instrument.borrow_rate`; a CFD or spread-bet short pays its funding
+  (`benchmark − markup`) and nothing more. The rate is not freely available, so there is
+  no default, and a direct short held with none set warns and is charged nothing. A single
+  rate per instrument; its variation over time is not modelled.
 - **Futures and forwards** carry no overnight funding at all — G7. No dated mode exists
   yet; whoever adds one must give it a stack with neither financing nor carry.
 - **Tiered margin is not modelled** (unchanged from §F) — users set a sensible maximum.

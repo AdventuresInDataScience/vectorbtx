@@ -65,6 +65,7 @@ from .rates.table import rate_table, static_rate_table, annual_to_period, day_co
 # --- holding costs (G) ---
 from .holding.financing import financing_charge, financing_rate, financing_series
 from .holding.carry import carry_charge, carry_series, tom_next_differential
+from .holding.borrow import borrow_charge, borrow_series
 from .holding.accrual import day_multipliers
 
 # --- aggregation ---
@@ -136,6 +137,8 @@ __all__ = [
     "carry_charge",
     "carry_series",
     "tom_next_differential",
+    "borrow_charge",
+    "borrow_series",
     "day_multipliers",
     "aggregate",
     "PortfolioBacktest",

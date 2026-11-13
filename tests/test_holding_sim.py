@@ -156,6 +156,23 @@ def test_charges_appear_in_reported_equity():
 
 
 @needs_vectorbt
+def test_charges_reach_the_totals_too():
+    """`total_profit` is also rebuilt from order records, so `final_value`, `total_return`
+    and stats' End Value need the charges added, as `cash_flow` does (Studio issue 15)."""
+    import vectorbtx as vbt
+
+    rates = vbt.x.static_rate_table(["GBP"], IDX, rate=0.05)
+    pf = vbt.Portfolio.from_holding_costs(
+        FLAT, _size(), _universe(), rates=rates, init_cash=10_000, freq="D"
+    )
+    last = _final_value(pf)
+    assert float(pf.holding_costs.to_numpy().sum()) < 0
+    assert float(np.ravel(pf.final_value())[0]) == pytest.approx(last)
+    assert float(np.ravel(pf.total_return())[0]) == pytest.approx(last / 10_000 - 1)
+    assert float(pf.stats()["End Value"]) == pytest.approx(last)
+
+
+@needs_vectorbt
 def test_no_holding_costs_leaves_cash_flow_untouched():
     """The override must be inert for every ordinary portfolio — §1.3 drop-in guarantee."""
     import vectorbtx as vbt
@@ -168,17 +185,39 @@ def test_no_holding_costs_leaves_cash_flow_untouched():
 
 @needs_vectorbt
 def test_short_is_credited_not_charged():
-    """The adverse markup must survive the round trip through the simulation, per bar."""
+    """The adverse markup must survive the round trip through the simulation, per bar.
+
+    On a CFD, which is financed on its full notional. Margin share dealing (`equity`)
+    finances only the account's overdraft, and a short sale adds cash rather than
+    borrowing it, so a share short is financed on nothing; see the test below. (This test
+    used `equity` once, and passed only because a short's value was counted as borrowed.)
+    """
     import vectorbtx as vbt
 
-    universe = _universe()
+    universe = vbt.load_universe(
+        {"A": vbt.Instrument(mode="cfd", quote_currency="GBP", contract_size=1.0, leverage=5.0)}
+    )
     rates = vbt.x.static_rate_table(["GBP"], IDX, rate=0.05)
 
     def charges(amount):
         pf = vbt.Portfolio.from_holding_costs(
             FLAT, _size(amount), universe, rates=rates, init_cash=10_000, freq="D"
         )
+        assert len(pf.orders.records) == 1
         return float(pf.holding_costs.to_numpy().sum())
 
     assert charges(150.0) < 0        # long pays benchmark + markup
     assert charges(-150.0) > 0       # short receives benchmark - markup
+
+
+@needs_vectorbt
+def test_a_share_short_borrows_no_cash_so_pays_no_financing():
+    import vectorbtx as vbt
+
+    rates = vbt.x.static_rate_table(["GBP"], IDX, rate=0.05)
+    pf = vbt.Portfolio.from_holding_costs(
+        FLAT, _size(-150.0), _universe(), rates=rates, init_cash=10_000, freq="D"
+    )
+    assert len(pf.orders.records) == 1
+    assert float(pf.x.borrowed_portion().to_numpy().max()) == 0.0
+    assert float(pf.holding_costs.to_numpy().sum()) == 0.0

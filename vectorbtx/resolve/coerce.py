@@ -33,7 +33,7 @@ STR_FIELDS = (
 )
 KEYWORD_FIELDS = ("slippage", "financing")
 SET_FIELDS = ("active_costs",)
-COST_MODULES = frozenset({"commission", "spread", "slippage", "financing", "carry"})
+COST_MODULES = frozenset({"commission", "spread", "slippage", "financing", "carry", "borrow"})
 
 
 class CoercionError(ValueError):

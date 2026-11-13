@@ -159,11 +159,14 @@ def build_charges(
         index: the backtest index.
         borrowed: DataFrame of borrowed notional per bar and column (Section F's
             `borrowed_portion`). Financing is charged on this and nothing else.
-        notional: DataFrame of full position notional, for carry.
+        notional: DataFrame of full position notional, for carry, full-notional
+            financing and the borrow fee.
         position: **signed** position size per bar and column. Supplies the direction
             each charge is computed in. Without it everything is treated as long, which
-            silently loses the adverse-markup asymmetry the whole module exists for.
-        rates: DataFrame of annualised benchmark rates, one column per currency.
+            silently loses the adverse-markup asymmetry the whole module exists for, and
+            charges no borrow fee because nothing is ever short.
+        rates: DataFrame of annualised benchmark rates, one column per currency. Without
+            it, financing and carry are not charged at all; the borrow fee still is.
         markup: broker financing markup, applied adversely. Default 3%.
         carry_markup: markup on the carry differential, also adverse.
         holidays: dates carrying no charge.
@@ -185,6 +188,7 @@ def build_charges(
     from ..instruments.defaults import financing_basis
     from ..rates.table import day_count_for
     from .accrual import day_multipliers
+    from .borrow import borrow_series, warn_unpriced_shorts
     from .carry import carry_series
     from .financing import financing_series
 
@@ -198,6 +202,27 @@ def build_charges(
     charges = pd.DataFrame(0.0, index=idx, columns=cols)
     no_pair = []
 
+    # ⚠️ Every input must be per COLUMN. Under cash sharing vectorbt reports
+    # `asset_value()` and `cash()` per GROUP by default, and a group's series used to be
+    # handed to every column in it: each instrument in a shared account was charged carry
+    # and full-notional financing on the whole account's positions, including instruments
+    # holding nothing. A frame lacking a column used to charge it nothing, just as
+    # silently. Both now raise here instead. The one exception is a one-column portfolio
+    # whose frame is labelled differently (an unnamed Series): there is only one column
+    # it can belong to.
+    for name, frame in (("borrowed", borrowed), ("notional", notional), ("position", position)):
+        if frame is None:
+            continue
+        have = pd.DataFrame(frame).columns
+        missing = [col for col in cols if col in universe and col not in have]
+        if missing and not (len(cols) == 1 and len(have) == 1):
+            raise ValueError(
+                f"build_charges needs `{name}` per column, and it has no column for "
+                f"{missing} (it has {list(have)}). Under cash sharing a portfolio reports "
+                f"per group by default: pass per-column values, e.g. "
+                f"pf.asset_value(group_by=False)."
+            )
+
     for col in cols:
         if col not in universe:
             continue
@@ -210,25 +235,34 @@ def build_charges(
         # GBP/SGD/ZAR markets, 360 elsewhere.
         day_count = day_count_for(spec.quote_currency)
 
-        if "financing" in spec.active_costs:
+        # ⚠️ Financing and carry are priced off the benchmark rate table, so they need
+        # `rates`. Without it `_rate_for` reads every benchmark as 0%, and the charge
+        # would be the broker's markup alone: an invented number. The front door has
+        # always required `rates` for them; this makes the replay path agree, and lets
+        # the borrow fee, which needs no benchmark, be charged without one.
+        basis = financing_basis(spec.mode)
+        source = borrowed if basis == "borrowed" else notional
+        if "financing" in spec.active_costs and rates is not None and source is not None:
             # ⚠️ The basis is mode-dependent and the two are NOT interchangeable.
             # Margin share dealing finances the debit balance; a spread bet or CFD is
             # funded by the broker in full and finances the whole notional. Charging a
             # CFD on the borrowed portion understates it by 1 - 1/leverage, and drops it
             # to zero for an unlevered position a broker would still bill in full.
-            basis = financing_basis(spec.mode)
-            source = borrowed if basis == "borrowed" else notional
-            if source is None:
-                continue
             b = np.abs(_col_series(source, col, len(idx)))
             bench = _rate_for(rates, spec.quote_currency, idx)
+            # ⚠️ On the borrowed basis the amount is the account's overdraft, and interest
+            # on an overdraft is always charged (`benchmark + markup`), whatever direction
+            # this instrument holds. A short adds cash rather than borrowing it, so it only
+            # carries a share of an overdraft that losses elsewhere ran up. Picking the
+            # rate by the instrument's direction would credit that share instead.
+            debit = np.full(len(idx), basis == "borrowed")
             charges[col] += np.where(
-                is_long,
+                is_long | debit,
                 financing_series(b, bench, markup, True, mult, day_count),
                 financing_series(b, bench, markup, False, mult, day_count),
             )
 
-        if "carry" in spec.active_costs and notional is not None:
+        if "carry" in spec.active_costs and rates is not None and notional is not None:
             # ⚠️ Carry is a differential, so it needs BOTH legs of the pair. A missing leg
             # used to be priced at 0% by `_rate_for`, so an FX instrument with no
             # `base_currency` paid (or earned) the whole quote-currency rate, while the
@@ -236,15 +270,25 @@ def build_charges(
             # that warning promises, and say so again here, where it bites.
             if spec.base_currency is None or spec.quote_currency is None:
                 no_pair.append(col)
-                continue
-            n = np.abs(_col_series(notional, col, len(idx)))
-            base_rate = _rate_for(rates, spec.base_currency, idx)
-            quote_rate = _rate_for(rates, spec.quote_currency, idx)
-            charges[col] += np.where(
-                is_long,
-                carry_series(n, base_rate, quote_rate, mult, carry_markup, True, day_count),
-                carry_series(n, base_rate, quote_rate, mult, carry_markup, False, day_count),
-            )
+            else:
+                n = np.abs(_col_series(notional, col, len(idx)))
+                base_rate = _rate_for(rates, spec.base_currency, idx)
+                quote_rate = _rate_for(rates, spec.quote_currency, idx)
+                charges[col] += np.where(
+                    is_long,
+                    carry_series(n, base_rate, quote_rate, mult, carry_markup, True, day_count),
+                    carry_series(n, base_rate, quote_rate, mult, carry_markup, False, day_count),
+                )
+
+        if "borrow" in spec.active_costs and spec.borrow_rate and notional is not None:
+            # The borrow fee on a direct short (`holding/borrow.py`; only `equity` stacks
+            # carry it): on the short's market value, only while short, always a charge.
+            # A rate of None or 0.0 charges nothing; None also warns below if a short was
+            # held.
+            short_value = np.where(is_long, 0.0, np.abs(_col_series(notional, col, len(idx))))
+            charges[col] += borrow_series(short_value, spec.borrow_rate, mult, day_count)
+
+    warn_unpriced_shorts(universe, position, cols, stacklevel=3)
 
     if no_pair and rates is not None:
         import warnings
@@ -260,18 +304,16 @@ def build_charges(
 
 
 def _col_series(frame, col, n) -> np.ndarray:
-    """One column's series, tolerating group-level reporting.
+    """One column's series from a per-column frame.
 
-    Under cash sharing vectorbt reports cash **per group**, so a per-column lookup fails
-    on every column but the first. A single reported column is the group's, which every
-    member shares; anything else with no match contributes nothing.
+    `build_charges` has already checked that the frame has this column, or that the
+    portfolio has only one column and the frame one series. The second case is the only
+    way to reach the fallback, so it cannot hand a group's series to one of its members.
     """
     frame = pd.DataFrame(frame)
     if col in frame.columns:
         return frame[col].to_numpy(dtype=float)
-    if frame.shape[1] == 1:
-        return frame.iloc[:, 0].to_numpy(dtype=float)
-    return np.zeros(n)
+    return frame.iloc[:, 0].to_numpy(dtype=float)
 
 
 def _direction_mask(position, col, n) -> np.ndarray:
@@ -441,7 +483,9 @@ def simulate_with_holding_costs(
         holidays: dates carrying no charge.
         order_kwargs: explicit `Order` field overrides, merged over the universe's.
         **kwargs: simulation arguments (`init_cash`, `cash_sharing`, `group_by`, `freq`,
-            `call_seq`, `seed`, ...), passed to **both** passes so they agree.
+            `call_seq`, `seed`, ...), passed to **both** passes so they agree. `init_cash`
+            is the account's **equity**: each instrument's leverage is funded on top of
+            it, as in `vbt.x.PortfolioBacktest`.
 
     Returns:
         `Portfolio`, with `pf.holding_costs` carrying the per-bar charges.
@@ -476,12 +520,32 @@ def simulate_with_holding_costs(
     sim_kwargs = {k: v for k, v in kwargs.items() if k not in _ORDER_DEFAULTS}
     resolved.update({k: v for k, v in kwargs.items() if k in _ORDER_DEFAULTS})
 
+    # Fund the leverage, exactly as the front door does (`vectorbtx.margin.buying_power`):
+    # the engine gets `equity x leverage` to spend, the loan is recorded on the portfolio,
+    # and `get_init_cash` reports the equity. ⚠️ Without this a margin account could never
+    # borrow here: a long is bounded by the engine's cash, so a 2x share position sized
+    # beyond equity was silently part-filled at 1x, and margin financing never fired.
+    margin_loan = None
+    if universe is not None and "init_cash" in sim_kwargs:
+        from ..margin.buying_power import buying_power
+
+        engine_cash, margin_loan = buying_power(
+            universe, sim_kwargs["init_cash"], columns,
+            cash_sharing=bool(sim_kwargs.get("cash_sharing", False)),
+        )
+        sim_kwargs["init_cash"] = engine_cash
+
     # --- Pass 1: establish positions, and therefore the borrowed portion. ---
-    base = cls.from_orders(close, size=size, **resolved, **sim_kwargs)
+    # The loan goes on before `borrowed_portion`, which reads the drawn loan as negative
+    # cash; on the engine's buying power the cash would never go negative.
+    base = cls.from_orders(close, size=size, **resolved, **sim_kwargs).replace(
+        margin_loan=margin_loan
+    )
 
     borrowed = borrowed_portion(base)
     position = pd.DataFrame(base.assets())
-    notional = pd.DataFrame(base.asset_value()).abs()
+    # Per column: under cash sharing the default is one series per group.
+    notional = pd.DataFrame(base.asset_value(group_by=False)).abs()
 
     charges = build_charges(
         universe,
@@ -514,7 +578,7 @@ def simulate_with_holding_costs(
         call_post_segment=True,  # never remove: financing accrues on order-less bars
         **sim_kwargs,
     )
-    return pf.replace(universe=universe, holding_costs=charges)
+    return pf.replace(universe=universe, holding_costs=charges, margin_loan=margin_loan)
 
 
 def apply_holding_costs(
@@ -564,7 +628,9 @@ def apply_holding_costs(
         universe,
         pf.wrapper.index,
         borrowed=pd.DataFrame(pf.x.borrowed_portion()),
-        notional=pd.DataFrame(pf.asset_value()).abs(),
+        # Per column: under cash sharing the default is one series per group, which
+        # charged every instrument on the whole account's positions.
+        notional=pd.DataFrame(pf.asset_value(group_by=False)).abs(),
         position=pd.DataFrame(pf.assets()),
         rates=rates,
         markup=_default_markup(markup),

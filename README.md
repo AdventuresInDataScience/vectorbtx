@@ -251,6 +251,10 @@ These follow from `mode` and `asset_class`; you do not set them per instrument.
   raises.
 - **An unleveraged CFD still pays in full.** You borrow nothing, but the broker funds the
   entire position.
+- **In a shared account each instrument pays on its own position.** Carry and full-notional
+  financing follow each instrument's own notional. The debit balance is the account's: it
+  is split between the instruments in proportion to their long market value, and each
+  share is charged at that instrument's own currency's rate.
 - **Day count follows the market's denomination:** /365 for GBP, SGD and ZAR; /360
   elsewhere.
 - **The markup is always adverse:** `benchmark + fee` long, `benchmark − fee` short. When
@@ -258,9 +262,31 @@ These follow from `mode` and `asset_class`; you do not set them per instrument.
 - **FX rolls Wednesday** (spot settles T+2, so the roll reaches Monday); everything else
   rolls **Friday** (nothing settles — the charge just covers the calendar weekend). Both
   bill seven days a week.
+- **A direct short pays a borrow fee; a CFD or spread bet short does not.** It follows how
+  the instrument is traded. Shorting something you trade directly (`mode="equity"`: a
+  share, ETF, fund or commodity product) means borrowing it, and the lender charges for
+  that, daily on the short's market value at the instrument's `borrow_rate` (an annual
+  fraction), accrued like financing. A CFD or spread bet borrows nothing: its short side
+  already pays funding at `benchmark − markup`, the whole cost of holding it. There is no
+  default rate, because none is published: with none set, nothing is charged and a held
+  short warns. `borrow_rate=0.0` says the borrow is free.
 
-Supplying `rates=` opts in; leave it out and no holding costs are applied. Charges are
-folded into reported cash, so `value`, `returns` and every metric include them:
+  ```python
+  instruments = {"VOD": dict(mode="equity", quote_currency="GBP", borrow_rate=0.005)}  # 0.5% a year
+  ```
+
+- **Financing is the same rule for every instrument:** the benchmark from `rates=` plus
+  `financing_markup=`. The per-instrument `financing` field is reserved for a possible
+  future per-instrument cost structure (professional desks negotiate one; retail accounts
+  do not) and resolves to `"auto"`, which means exactly that rule. A number in it is not
+  used, and warns.
+
+Supplying `rates=` opts in to financing and carry; leave it out and neither is applied. The
+borrow fee needs no `rates=`: setting `borrow_rate` is its opt-in. Charges are
+folded into reported cash and into `total_profit`, so `value`, `returns`, `final_value`,
+`total_return` and every metric in `pf.stats()` and `pf.returns_stats()` include them.
+Trade P&L (`pf.trades.pnl`) and the MT5 trade metrics built from it do not: a charge accrues
+per bar, not per trade, so it has no trade to belong to.
 
 ```python
 pf = vbt.x.PortfolioBacktest(close=close, open=open_, high=high, low=low, ..., rates=rates)
@@ -270,7 +296,8 @@ pf.holding_costs             # per-bar, per-column signed cash adjustments
 `Portfolio.from_holding_costs` is the level-3 alternative: it replays orders through
 `from_order_func` so the simulation's own cash reflects the charges as it runs. Use it only
 when a strategy sizes off live equity while near fully invested — it needs explicit sizes
-and cannot express entries and exits.
+and cannot express entries and exits. Its `init_cash` is the account's equity, and each
+instrument's leverage is funded on top of it, as in `PortfolioBacktest`.
 
 ---
 
@@ -599,7 +626,7 @@ design, so `vbt.x.<tab>` is a complete inventory of the extras surface.
 #### `margin/exposure.py`
 | Symbol | Does | Calls | Called by |
 |---|---|---|---|
-| `borrowed_portion(pf)` | Post-simulation split into borrowed vs cash-covered, from `pf.cash(free=True)` and `pf.asset_value()`. **A hard requirement for Section G**, since F2 was not built. | vbt `Portfolio` | `holding.callback`, `pf.x` |
+| `borrowed_portion(pf)` | Post-simulation borrowing: each account's overdraft, `max(0, -cash)`, with a shared account's split between its instruments by long market value. **A hard requirement for Section G**, since F2 was not built. | vbt `Portfolio`, `split_by_long_value` | `holding.callback`, `pf.x` |
 | `margin_level(pf, universe)` | Equity / margin required, per bar, as a percentage. | `margin_required` | `min_margin_level` |
 | `min_margin_level(pf, universe)` | The lowest ratio over the backtest — an MT5 parity metric, satisfied without F2. | `margin_level` | `pf.x`, K2 |
 
@@ -654,6 +681,13 @@ exceeds 5%" is `calendar & threshold`.
 | `tom_next_differential(base_rate, quote_rate)` | The interest differential, tom-next, not an interpolation. | — | `carry_charge` |
 | `carry_charge(notional, differential, day_multiplier)` | Applies to **any** FX position regardless of leverage — you are long one currency and short another either way. Conceptually distinct from financing; separate module, separate rates, separate multipliers. | — | `build_charges`, the user |
 | `carry_series(...)` | Vectorised. | `carry_charge` | `build_charges` |
+
+#### `holding/borrow.py`
+| Symbol | Does | Calls | Called by |
+|---|---|---|---|
+| `borrow_charge(short_value, annual_rate, day_multiplier, day_count)` | The borrow fee on a direct (`equity`) short for one period: `-|short value| x rate x days / day count`. **Always a charge**, never a credit. CFDs and spread bets have none: their short already pays funding. | `annual_to_period` | `borrow_series`, the user |
+| `borrow_series(...)` | Vectorised; the short value is zero wherever the position is not short. | `borrow_charge` | `build_charges` |
+| `warn_unpriced_shorts(universe, position, columns)` | Warns about every direct short held with the fee active and no `borrow_rate` — a free borrow is never silent (G6). | — | `build_charges`, the front door |
 
 #### `holding/accrual.py`
 | Symbol | Does | Calls | Called by |
@@ -809,9 +843,12 @@ Documented rather than hidden. Each traces to a recorded design decision.
 8. **Maintenance margin, margin calls and forced liquidation are not modelled.** A
    position can draw its whole margin loan and sit there. `pf.x.min_margin_level()`
    reports how close it came.
-9. **Short share borrow charge is not modelled.** The rate is instrument-specific,
-   time-varying and not available from any free source, so modelling it would mean
-   inventing numbers. Short share CFD strategies look cheaper here than in reality.
+9. **The borrow fee on a direct short needs a rate from you.** The rate is
+   instrument-specific, time-varying and not available from any free source, so there is
+   no default: set `borrow_rate` on each security you short directly (`mode="equity"`).
+   A direct short held with none set is charged nothing, and warns. CFDs and spread bets
+   have no borrow fee: their short side's funding is its cost. A single rate per
+   instrument; its variation over time is not modelled.
 10. **Futures and forwards have no mode.** They attract no overnight funding at all — the
     cost is in a wider spread — so a future mode would need a stack with neither financing
     nor carry.

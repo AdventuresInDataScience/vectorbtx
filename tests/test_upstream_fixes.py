@@ -646,6 +646,314 @@ def test_selection_across_accounts_raises_and_groups_still_select():
         pf["Z"]
 
 
+# ############# 15. Holding costs reach the totals ############# #
+
+
+def _one(value):
+    """The single number in a one-column result (a Series, under a one-column DataFrame)."""
+    return float(np.ravel(np.asarray(value, dtype=float))[0])
+
+
+def _carry_only():
+    """A long EURUSD spread bet in a flat market with no spread: carry is all that moves."""
+    import vectorbtx as vbt
+
+    o, h, l, c = frames([1.10] * 12, [1.1005] * 12, [1.0995] * 12, columns=("EURUSD",))
+    rates = vbt.x.static_rate_table(["EUR", "USD"], c.index, {"EUR": 0.03, "USD": 0.045})
+    return run(o, h, l, c, entries=mask(c.index, ["EURUSD"], [("EURUSD", 0)]),
+               exits=mask(c.index, ["EURUSD"]), instruments={"EURUSD": FX_SPREADBET},
+               size=10_000, rates=rates, init_cash=10_000)
+
+
+def _carry_book(cash):
+    """Two FX spread bets on random walks, with stops (so split bars) and carry."""
+    import vectorbtx as vbt
+
+    rng = np.random.default_rng(3)
+    index = pd.bdate_range("2024-01-01", periods=120)
+    columns = ["A", "B"]
+    c = pd.DataFrame(1.10 * np.exp(np.cumsum(rng.normal(0, 0.003, (120, 2)), axis=0)),
+                     index=index, columns=columns)
+    o = c.shift(1).fillna(c)
+    h, l = np.maximum(o, c) * 1.002, np.minimum(o, c) * 0.998
+    entries = pd.DataFrame(rng.random((120, 2)) < 0.08, index=index, columns=columns)
+    exits = pd.DataFrame(rng.random((120, 2)) < 0.05, index=index, columns=columns)
+    rates = vbt.x.static_rate_table(["EUR", "USD"], index, {"EUR": 0.03, "USD": 0.045})
+    return run(o, h, l, c, entries=entries, exits=exits,
+               instruments={k: FX_SPREADBET for k in columns}, size=10_000, stop_points=30,
+               rates=rates, init_cash=10_000, cash=cash)
+
+
+def test_holding_costs_reach_total_profit_final_value_total_return_and_stats():
+    """Studio issue 15: carry reached `value()` but not `total_profit`, so `final_value`,
+    `total_return` and stats' End Value and Total Return reported the result before carry
+    while the equity curve, Sharpe and drawdown in the same tear sheet included it."""
+    pf = _carry_only()
+    charged = float(pf.holding_costs.to_numpy().sum())
+    last = float(pd.DataFrame(pf.value()).iloc[-1, 0])
+    assert charged < -1                                  # a real charge, so the test can fail
+    assert _one(pf.total_profit()) == pytest.approx(charged)
+    assert _one(pf.final_value()) == pytest.approx(last)
+    assert _one(pf.total_return()) == pytest.approx(last / 10_000 - 1)
+    stats = pf.stats()
+    assert float(stats["End Value"]) == pytest.approx(last)
+    assert float(stats["Total Return [%]"]) == pytest.approx((last / 10_000 - 1) * 100)
+
+
+def test_trade_pnl_stays_before_holding_costs():
+    """By design: a charge accrues per bar on whatever is held, so it has no trade to
+    belong to. Trade P&L and the MT5 trade metrics leave it out; the totals add it."""
+    pf = _carry_only()
+    trade_pnl = _one(pf.trades.pnl.sum())
+    assert trade_pnl == pytest.approx(0.0, abs=1e-9)    # a flat market with no spread
+    assert _one(pf.total_profit()) == pytest.approx(
+        trade_pnl + float(pf.holding_costs.to_numpy().sum()))
+
+
+@pytest.mark.parametrize("cash", ["shared", "per_instrument"])
+def test_totals_match_the_equity_curve_with_holding_costs(cash):
+    """Per account and per column, on split bars: the totals are the curve's last value."""
+    pf = _carry_book(cash)
+    assert pf.holding_costs.to_numpy().sum() < 0
+    for group_by in (None, False):
+        last = pd.DataFrame(pf.value(group_by=group_by)).iloc[-1].to_numpy(dtype=float)
+        init = np.ravel(np.asarray(pf.get_init_cash(group_by=group_by), dtype=float))
+        assert np.ravel(pf.final_value(group_by=group_by)) == pytest.approx(last)
+        assert np.ravel(pf.total_return(group_by=group_by)) == pytest.approx(last / init - 1)
+
+
+def test_contributions_to_a_shared_account_carry_their_own_holding_costs():
+    pf = _carry_book("shared")
+    assert sum(float(pf[k].total_profit()) for k in "AB") == pytest.approx(_one(pf.total_profit()))
+    assert [float(pf[k].total_profit()) for k in "AB"] == pytest.approx(
+        pf.total_profit(group_by=False).tolist())
+    a = pf["A"]
+    assert _one(a.final_value()) == pytest.approx(float(pd.DataFrame(a.value()).iloc[-1, 0]))
+
+
+# ############# 16. Holding costs per instrument in a shared account ############# #
+
+
+def _by_column(pf):
+    """Every order as (column, bar, side, price), sorted: record order differs by cash model."""
+    r = pf.orders.records_readable
+    return sorted((str(k), pf.wrapper.index.get_loc(t), s, round(float(p), 9))
+                  for k, t, s, p in zip(r["Column"], r["Timestamp"], r["Side"], r["Price"]))
+
+
+def test_an_instrument_in_a_shared_account_pays_carry_on_its_own_position_only():
+    """Carry was read off `asset_value()`, which a shared account reports per group, so
+    every instrument paid carry on the whole account's position: B, holding nothing, paid
+    exactly what A paid. Separate accounts charged B nothing, as they should."""
+    import vectorbtx as vbt
+
+    o, h, l, c = frames([1.10] * 12, [1.1005] * 12, [1.0995] * 12, columns=("A", "B"))
+    rates = vbt.x.static_rate_table(["EUR", "USD"], c.index, {"EUR": 0.03, "USD": 0.045})
+    charged = {}
+    for cash in ("per_instrument", "shared"):
+        pf = run(o, h, l, c, entries=mask(c.index, ["A", "B"], [("A", 0)]),
+                 exits=mask(c.index, ["A", "B"]), instruments={"A": FX_SPREADBET, "B": FX_SPREADBET},
+                 size=10_000, rates=rates, init_cash=10_000, cash=cash)
+        charged[cash] = pf.holding_costs.sum()
+    assert charged["shared"]["A"] < -1                   # a real charge, so the test can fail
+    assert charged["shared"]["B"] == 0.0
+    assert charged["shared"].tolist() == pytest.approx(charged["per_instrument"].tolist())
+
+
+def test_the_same_orders_pay_the_same_carry_whichever_cash_model():
+    """Carry depends on each position, not on whose cash funded it. With cash to spare
+    both models place the same orders, so they must be charged the same, bar by bar."""
+    shared, separate = _carry_book("shared"), _carry_book("per_instrument")
+    assert _by_column(shared) == _by_column(separate)
+    assert shared.holding_costs.to_numpy() == pytest.approx(separate.holding_costs.to_numpy())
+
+
+def test_the_replay_path_charges_each_instrument_its_own_carry_in_a_shared_account():
+    import vectorbtx as vbt
+
+    o, h, l, c = frames([1.10] * 12, [1.1005] * 12, [1.0995] * 12, columns=("A", "B"))
+    universe = vbt.load_universe({k: vbt.Instrument(**FX_SPREADBET) for k in "AB"})
+    rates = vbt.x.static_rate_table(["EUR", "USD"], c.index, {"EUR": 0.03, "USD": 0.045})
+    # The minimum stake is 10,000 units, and this level-3 path takes `init_cash` literally
+    # (no buying power), so the account must cover the full 11,000 notional.
+    size = pd.DataFrame(np.nan, index=c.index, columns=["A", "B"])
+    size.iloc[0] = [10_000.0, np.nan]
+    charged = {}
+    for shared in (False, True):
+        pf = vbt.Portfolio.from_holding_costs(c, size, universe, rates=rates, init_cash=50_000,
+                                              cash_sharing=shared, group_by=shared or None, freq="D")
+        assert len(pf.orders.records) == 1
+        charged[shared] = pf.holding_costs.sum()
+    assert charged[True]["A"] < 0
+    assert charged[True]["B"] == 0.0
+    assert charged[True].tolist() == pytest.approx(charged[False].tolist())
+
+
+def test_charges_refuse_a_per_account_frame_for_several_instruments():
+    """The old fallback handed a one-column frame to every column; it now says what to pass."""
+    import vectorbtx as vbt
+    from vectorbtx.holding.callback import build_charges
+
+    o, h, l, c = frames([1.10] * 4, columns=("A", "B"))
+    universe = vbt.load_universe({k: vbt.Instrument(**FX_SPREADBET) for k in "AB"})
+    rates = vbt.x.static_rate_table(["EUR", "USD"], c.index, {"EUR": 0.03, "USD": 0.045})
+    account = pd.DataFrame({"group": [11_000.0] * 4}, index=c.index)
+    with pytest.raises(ValueError, match="per column"):
+        build_charges(universe, c.index, notional=account, rates=rates, columns=["A", "B"])
+
+
+EQUITY_2X = {"mode": "equity", "point_size": 1.0, "quote_currency": "GBP", "spread_points": 0.0,
+             "leverage": 2.0}
+
+
+def _margin_account(units, cash="shared"):
+    """10,000 of equity at 2x, flat prices of 100, buying `units` of A and B at bar 1's open.
+    Financing is 5% + 3% = 8% a year on the debit, /365 for GBP."""
+    import vectorbtx as vbt
+
+    o, h, l, c = frames([100.0] * 12, columns=("A", "B"))
+    entries = mask(c.index, ["A", "B"], [(k, 0) for k in units])
+    size = pd.DataFrame({k: float(units.get(k, 0)) for k in "AB"}, index=c.index)
+    rates = vbt.x.static_rate_table(["GBP"], c.index, {"GBP": 0.05})
+    return run(o, h, l, c, entries=entries, exits=mask(c.index, ["A", "B"]),
+               instruments={k: EQUITY_2X for k in "AB"}, size=size, rates=rates,
+               init_cash=10_000, cash=cash, financing_markup=0.03)
+
+
+@pytest.mark.parametrize("units, split", [
+    ({"A": 80, "B": 80}, [3_000, 3_000]),     # neither alone exceeds the equity: was 0, 0
+    ({"A": 120, "B": 40}, [4_500, 1_500]),    # by long market value
+    ({"A": 150}, [5_000, 0]),                 # unchanged: one instrument borrows it all
+])
+def test_a_shared_margin_account_is_financed_on_its_debit_split_by_long_value(units, split):
+    """Each instrument's borrowing was read as if it had the account's whole equity to
+    itself, so two that together borrowed 6,000 against 10,000 showed none and paid none.
+    The account's debit is now split between them in proportion to their long value."""
+    pf = _margin_account(units)
+    before_charges = pf.replace(holding_costs=None)     # charges are computed from this
+    thursday = 3                                         # one day's accrual, no weekend
+    assert before_charges.x.borrowed_portion().iloc[thursday].tolist() == pytest.approx(split)
+    assert float(before_charges.x.borrowed_portion(group_by=None).iloc[thursday, 0]) == \
+        pytest.approx(sum(split))
+    assert pf.holding_costs.iloc[thursday].tolist() == pytest.approx(
+        [-amount * 0.08 / 365 for amount in split])
+
+
+def test_the_split_adds_up_and_falls_back_to_equal_shares():
+    """Two accounts, (A, B) and (C, D). Shorts take no share; an account that owes money
+    but holds no longs (only after losses beyond the account) splits it equally."""
+    from vectorbtx.margin.exposure import split_by_long_value
+
+    debit = [[6_000.0, 0.0],
+             [6_000.0, 1_000.0],
+             [0.0, 500.0]]
+    long_value = [[12_000.0, 4_000.0, -3_000.0, np.nan],
+                  [10_000.0, -2_000.0, 0.0, np.nan],     # D not yet priced
+                  [5_000.0, 5_000.0, 5_000.0, 0.0]]
+    got = split_by_long_value(debit, long_value, [0, 0, 1, 1])
+    np.testing.assert_allclose(got, [[4_500, 1_500, 0, 0],
+                                     [6_000, 0, 500, 500],
+                                     [0, 0, 500, 0]])
+    assert got[:, :2].sum(axis=1).tolist() == pytest.approx([6_000, 6_000, 0])
+    assert got[:, 2:].sum(axis=1).tolist() == pytest.approx([0, 1_000, 500])
+
+
+def test_separate_accounts_grouped_add_their_borrowing_up():
+    """Summing the group's cash let B's spare 10,000 pay off A's 5,000 debt."""
+    pf = _margin_account({"A": 150}, cash="per_instrument").replace(holding_costs=None)
+    assert pf.x.borrowed_portion().iloc[3].tolist() == pytest.approx([5_000, 0])
+    assert float(pf.x.borrowed_portion(group_by=True).iloc[3, 0]) == pytest.approx(5_000)
+
+
+# ############# 17. Borrowing without a margin loan; leverage on the replay path ############# #
+
+
+def test_a_fully_paid_share_portfolio_borrows_nothing_and_pays_no_financing():
+    """The rebalancing path runs without a margin loan, and borrowing then fell back to
+    `|asset value| - free cash` measured after the purchase: a fully invested 60/40 book
+    counted every pound as borrowed and paid margin financing on all of it."""
+    import vectorbtx as vbt
+
+    o, h, l, c = frames([100.0] * 12, columns=("A", "B"))
+    weights = pd.DataFrame({"A": 0.6, "B": 0.4}, index=c.index)
+    rates = vbt.x.static_rate_table(["GBP"], c.index, {"GBP": 0.05})
+    pf = run(o, h, l, c, instruments={k: EQUITY_2X for k in "AB"}, weights=weights,
+             rates=rates, init_cash=10_000, financing_markup=0.03)
+    invested = float(pd.DataFrame(pf.asset_value(group_by=False)).iloc[-1].sum())
+    assert invested == pytest.approx(10_000, rel=1e-2)          # fully invested, all paid for
+    assert float(pf.x.borrowed_portion().to_numpy().max()) == 0.0
+    assert float(pf.holding_costs.to_numpy().sum()) == 0.0
+
+
+def test_a_cash_paid_position_built_outside_the_front_door_borrows_nothing():
+    """8,000 bought from 10,000 leaves 2,000 of cash; it counted as 6,000 borrowed."""
+    import vectorbtx as vbt
+
+    c = frames([100.0] * 6)[3]
+    size = pd.DataFrame(np.nan, index=c.index, columns=["X"])
+    size.iloc[0] = 80.0
+    pf = vbt.Portfolio.from_orders(c, size=size, init_cash=10_000, freq="D")
+    assert float(pd.DataFrame(pf.cash()).iloc[-1, 0]) == pytest.approx(2_000)
+    assert float(pf.x.borrowed_portion().to_numpy().max()) == 0.0
+
+
+def _replay(units, cash_sharing=False, leverage=2.0):
+    """The level-3 replay path: buy `units` at 100 on bar 0 on 10,000 of equity; GBP at
+    5% plus a 3% markup is 8% a year on any overdraft, /365."""
+    import vectorbtx as vbt
+
+    c = frames([100.0] * 12, columns=("A", "B"))[3]
+    universe = vbt.load_universe({
+        k: vbt.Instrument(mode="equity", quote_currency="GBP", leverage=leverage) for k in "AB"
+    })
+    size = pd.DataFrame(np.nan, index=c.index, columns=["A", "B"])
+    size.iloc[0] = [float(units.get(k, np.nan)) for k in "AB"]
+    rates = vbt.x.static_rate_table(["GBP"], c.index, {"GBP": 0.05})
+    return vbt.Portfolio.from_holding_costs(
+        c, size, universe, rates=rates, markup=0.03, init_cash=10_000,
+        cash_sharing=cash_sharing, group_by=True if cash_sharing else None, freq="D",
+    )
+
+
+def _spent(pf):
+    """What every order cost, fill price (with slippage) times size plus fees."""
+    r = pf.orders.records
+    return float((r["size"] * r["price"] + r["fees"]).sum())
+
+
+def test_the_replay_path_funds_leverage_like_the_front_door():
+    """It handed `init_cash` to the engine as its cash, so a margin account could never
+    borrow: 150 shares at 100 on 10,000 at 2x part-filled at 100 shares, and margin
+    financing never fired. Now the engine gets the buying power and equity is reported."""
+    pf = _replay({"A": 150})
+    thursday = 3
+    owed = _spent(pf) - 10_000       # 15,000 plus the default slippage, less the equity
+    assert float(pd.DataFrame(pf.assets())["A"].iloc[-1]) == pytest.approx(150)
+    assert np.ravel(pf.get_init_cash()).tolist() == pytest.approx([10_000, 10_000])
+    assert pf.replace(holding_costs=None).x.borrowed_portion().iloc[thursday].tolist() == \
+        pytest.approx([owed, 0])
+    assert pf.holding_costs.iloc[thursday].tolist() == pytest.approx([-owed * 0.08 / 365, 0])
+    slippage = _spent(pf) - 150 * 100
+    assert float(pd.DataFrame(pf.value())["A"].iloc[-1]) == pytest.approx(
+        10_000 - slippage + float(pf.holding_costs["A"].sum()))     # equity, not buying power
+
+
+def test_the_replay_path_shares_one_funded_account_and_splits_its_debit():
+    pf = _replay({"A": 80, "B": 80}, cash_sharing=True)
+    thursday = 3
+    each = (_spent(pf) - 10_000) / 2     # equal holdings take equal shares of the overdraft
+    assert pf.replace(holding_costs=None).x.borrowed_portion().iloc[thursday].tolist() == \
+        pytest.approx([each, each])
+    assert pf.holding_costs.iloc[thursday].tolist() == pytest.approx([-each * 0.08 / 365] * 2)
+
+
+def test_an_unlevered_replay_borrows_nothing():
+    """At 1x, 8,000 of 10,000 is paid for; it was financed as 6,000 borrowed."""
+    pf = _replay({"A": 80}, leverage=1.0)
+    assert float(pf.x.borrowed_portion().to_numpy().max()) == 0.0
+    assert float(pf.holding_costs.to_numpy().sum()) == 0.0
+
+
 # ############# Stop-adjustment callbacks on split bars (Studio issue 14) ############# #
 
 if HAS_VECTORBT:

@@ -7,6 +7,7 @@ this file.
 
 from __future__ import annotations
 
+import math
 import warnings
 
 from .defaults import ASSET_CLASSES, MODES, max_leverage
@@ -14,6 +15,14 @@ from .defaults import ASSET_CLASSES, MODES, max_leverage
 
 class SpecError(ValueError):
     """Raised when an `Instrument` describes something no broker would trade."""
+
+
+_NO_BORROW_FEE = (
+    "{what} a borrow fee is paid only for shorting a security you trade directly "
+    "(mode='equity': a share, ETF, fund or commodity product). This instrument is a "
+    "{mode!r}: a CFD or spread bet borrows nothing, and its short side already pays its "
+    "funding (benchmark - markup) as financing. Remove it."
+)
 
 
 def _positive(value, name: str, allow_none: bool = True):
@@ -112,6 +121,34 @@ def validate_spec(spec) -> None:
     if spec.spread_points is not None and spec.spread_points < 0:
         raise SpecError(f"spread_points must be >= 0, got {spec.spread_points!r}")
 
+    # --- the borrow fee: direct trading only, never a credit, never ignored ---
+    # It follows how the instrument is traded (`DEFAULT_STACKS`): shorting a security you
+    # trade directly borrows it; a CFD or spread bet's short already pays its funding.
+    if spec.borrow_rate is not None:
+        rate = spec.borrow_rate
+        if isinstance(rate, bool) or not isinstance(rate, (int, float)) or not math.isfinite(rate):
+            raise SpecError(
+                f"borrow_rate must be a finite annual fraction (0.005 for 0.5% a year), "
+                f"got {rate!r}"
+            )
+        if rate < 0:
+            raise SpecError(
+                f"borrow_rate must be >= 0, got {rate!r}: a borrow fee is always paid by "
+                f"the short, never received."
+            )
+        if spec.mode != "equity":
+            raise SpecError(_NO_BORROW_FEE.format(what="borrow_rate is set, but", mode=spec.mode))
+        if spec.active_costs and "borrow" not in spec.active_costs:
+            raise SpecError(
+                f"borrow_rate={rate!r} is set but active_costs "
+                f"({'|'.join(sorted(spec.active_costs))}) leaves out 'borrow', so the fee "
+                f"would be silently ignored. Add 'borrow' to active_costs, or remove "
+                f"borrow_rate."
+            )
+    if "borrow" in spec.active_costs and spec.mode != "equity":
+        raise SpecError(_NO_BORROW_FEE.format(what="active_costs includes 'borrow', but",
+                                              mode=spec.mode))
+
     # ⚠️ An FX-underlying position has ONE overnight charge and it is the tom-next swap,
     # which already embeds both currencies' interest rates. A leverage-driven financing
     # charge on top bills the same money twice — and it is invisible, because both are
@@ -160,6 +197,16 @@ def validate_spec(spec) -> None:
 
     check_keyword("slippage", spec.slippage)
     check_keyword("financing", spec.financing)
+
+    # ⚠️ `financing` is reserved (see `Instrument`): nothing reads a number, and it used
+    # to be accepted in silence, so a rate typed into it looked set and was not.
+    if spec.financing is not None and spec.financing != "auto":
+        warnings.warn(
+            f"financing={spec.financing!r} is not used. Financing is the benchmark from the "
+            f"backtest's rates= plus financing_markup=, the same for every instrument; the "
+            f"per-instrument financing field is reserved for future use. Leave it unset.",
+            stacklevel=3,
+        )
 
 
 def validate_universe(specs: dict) -> None:

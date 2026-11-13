@@ -246,7 +246,7 @@ Seven limitations, documented rather than hidden:
  6. End-of-day time is inert on daily bars.
  7. Day count follows the market: /365 for GBP, SGD, ZAR; /360 elsewhere.
  8. Taxes are out of scope — no stamp duty, no CGT. Cross-mode comparison is PRE-TAX.
- 9. Short share borrow charge is not modelled (understates short-side cost).
+ 9. A direct (equity) short's borrow fee needs borrow_rate from you; CFDs/spread bets have none.
 
 Deferred deliberately: maintenance margin, margin calls, forced liquidation.
 """)

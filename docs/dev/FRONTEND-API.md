@@ -36,6 +36,13 @@ mode="fx_spot"    ──►  lots x contract size. pips, carry regardless of lev
 | `leverage` default | 2× | 5/10/30× by asset class | 5/10/30× by asset class | 2× |
 | `carry` | no | fx asset class only | fx asset class only | **always** |
 | `financing` | yes | yes | yes | no |
+| `borrow_rate` (a short's borrow fee) | **yes** | rejected — funding covers the short | rejected — funding covers the short | rejected |
+
+The `financing` row is the cost module. The `financing=` *argument* is reserved: financing
+is always the benchmark from `rates=` plus `financing_markup=`, for every instrument alike,
+and the argument resolves to `"auto"`, which means exactly that. It is kept for a possible
+future per-instrument cost structure, which professional desks negotiate and retail
+accounts do not see; a number passed to it is not used, and warns.
 | `price_field` default | `adj_close` | `close` | `close` | `close` |
 
 Rejected cells raise at construction. A spread bet with a `contract_size` is not a warning

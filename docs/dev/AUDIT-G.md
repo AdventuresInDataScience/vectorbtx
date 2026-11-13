@@ -31,7 +31,7 @@ where possible. Findings are graded:
 | G3 | Triple day is Friday for shares/indices, Wednesday only for FX | **DEFAULT** | Mis-times the weekend roll for non-FX |
 | G4 | Day count is 365 for GBP markets, 360 elsewhere | **DEFAULT** | ~1.4% overstatement on every GBP position |
 | G5 | FX admin fee defaults to zero | **DEFAULT** | Omits the broker's entire FX funding margin |
-| G6 | Short share borrow charge not modelled | **GAP** | Understates cost of short share positions |
+| G6 | Short borrow charge | **RESOLVED** — direct (`equity`) shorts pay a user-supplied `borrow_rate`; CFD and spread-bet shorts pay their funding only | Was: understated the cost of short positions |
 | G7 | Futures and forwards carry no overnight funding | **GAP** | Only matters if dated products are added |
 | G8 | Holidays are zeroed; brokers still fund them | **DEFAULT** | Small, systematic understatement |
 | G9 | Markup is adverse in both directions | **CONFIRMED** | — |
@@ -161,18 +161,44 @@ the adverse-application machinery in `tom_next_differential` is already correct.
 
 ---
 
-## G6 — Short share borrow charge — GAP — *document, do not build*
+## G6 — Short borrow charge — RESOLVED — *direct shorts, from a user-supplied rate*
 
 Shorting a share CFD incurs a **borrow charge** separate from funding, reflecting the cost
 of locating the stock, and it varies by stock and can change at short notice. IG bills it
 as a daily cash adjustment including an administration fee.
 
-**Assessment.** Correctly out of scope for v1: the rate is instrument-specific,
+**Original assessment (v1).** Out of scope: the rate is instrument-specific,
 time-varying, and not available from any free data source, so modelling it would mean
 inventing numbers. **But it must be documented as a known understatement of short-side
 cost**, alongside the plan's existing limitations list. Short-share-CFD strategies will
 look better here than in reality, and that is exactly the direction users should be warned
 about.
+
+**Resolution (owner's decision, 13 November 2026).** The fee follows **how the instrument
+is traded, not what it is**:
+
+* **Traded directly** (`mode="equity"`: a share, ETF, fund or commodity product): to
+  short it you borrow the security, and the lender charges for that. This is the fee
+  modelled.
+* **CFDs and spread bets**: no borrow fee. Their short side's cost is already its
+  funding, `benchmark − markup` (credited, or charged when the markup exceeds the
+  benchmark), which is modelled as financing; a separate fee would charge twice. An index
+  can only be traded this way, so it never pays one. The broker-billed charge described
+  above is taken to be covered by that funding.
+
+Built so as to invent nothing: **the user supplies the rate**, as
+`Instrument.borrow_rate` (annual fraction), and there is no default.
+
+* Charged in `holding/borrow.py`, through `build_charges`: on the short's market value,
+  only while short, accrued like financing (daily, weekend on the triple day, the
+  market's day count). Always a charge. It needs no `rates=`.
+* `borrow` is a cost module in the `equity` stack, whatever the asset class, and only
+  there; `validate_spec` rejects a `borrow_rate` or `borrow` module in any other mode.
+* With no rate set, nothing is charged and **a held short warns**, naming the
+  instruments. `borrow_rate=0.0` states that the borrow is free and silences it. That
+  keeps the original concern: the understatement is never silent.
+* A single rate per instrument. The fee's variation over time is still not modelled; a
+  user who knows a name became hard to borrow should test a higher rate.
 
 ---
 

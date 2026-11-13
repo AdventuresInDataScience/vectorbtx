@@ -169,8 +169,18 @@ FINANCING_BASIS = {
 #: non-FX underlying works the other way: an interbank rate plus the broker's admin fee,
 #: and no carry. `validate_spec` enforces the exclusion so it cannot be reintroduced by
 #: hand.
+#:
+#: **`borrow` — the borrow fee on a short — is in the `equity` stack, and only there.**
+#: Which positions pay it depends on how the instrument is traded, not on what it is.
+#: Shorting something you trade directly (`equity`: a share, ETF, fund or commodity
+#: product) means borrowing that security, and the lender charges for it. A CFD or spread
+#: bet borrows nothing: its short side already pays (or earns) funding at
+#: `benchmark - markup`, which is the whole cost of holding it, so a borrow fee there
+#: would charge twice. (An index can only be traded through a CFD or spread bet, so it
+#: never pays one.) The rate is the instrument's `borrow_rate`; with none set, nothing is
+#: charged and a held short warns (G6: there is no default worth trusting).
 DEFAULT_STACKS = {
-    ("equity", None): ("commission", "spread", "slippage", "financing"),
+    ("equity", None): ("commission", "spread", "slippage", "financing", "borrow"),
     ("fx_spot", None): ("commission", "spread", "slippage", "carry"),
     ("cfd", "fx"): ("commission", "spread", "slippage", "carry"),
     ("cfd", None): ("commission", "spread", "slippage", "financing"),
@@ -294,6 +304,11 @@ def fill_defaults(spec):
 
     if not spec.active_costs:
         changes["active_costs"] = default_cost_stack(spec.mode, asset_class)
+
+    # Financing is the backtest's benchmark (`rates=`) plus `financing_markup=`; the
+    # per-instrument field is reserved (see `Instrument.financing`).
+    if spec.financing is None:
+        changes["financing"] = "auto"
 
     if spec.rounding is None:
         from ..core.settings import get

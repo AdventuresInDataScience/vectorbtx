@@ -445,23 +445,33 @@ def PortfolioBacktest(
             pf, universe, rates=rates, markup=financing_markup,
             carry_markup=carry_markup, holidays=holidays,
         )
+    else:
+        # No holding cost is computed, so nothing else would notice a short share held
+        # with no borrow rate. It must not borrow for free in silence (G6).
+        from ..holding.borrow import warn_unpriced_shorts
+
+        warn_unpriced_shorts(universe, pd.DataFrame(pf.assets()), list(pf.wrapper.columns),
+                             stacklevel=4)
     return pf
 
 
 def _wants_holding_costs(universe, rates) -> bool:
-    """True when any instrument has financing or carry active and rates were supplied.
+    """True when any holding cost can be charged: financing or carry with `rates`
+    supplied, or a stock-borrow fee with a rate set.
 
-    Deliberately requires `rates`. Routing to `from_order_func` is the slowest and most
-    fragile path in the library (it is the only level-3 one), so it is opt-in by the user
-    actually supplying the data it needs rather than implied by a mode default — every
-    mode's default stack contains financing or carry.
+    Financing and carry deliberately require `rates`: they are priced off the benchmark
+    table, and every mode's default stack contains one of them, so they are opt-in by the
+    user supplying the data rather than implied by a mode default. The borrow fee needs
+    no benchmark; its rate is the instrument's own `borrow_rate`, so setting one is the
+    opt-in.
     """
-    if rates is None:
-        return False
-    return any(
-        {"financing", "carry"} & set(spec.filled().active_costs)
-        for spec in universe.specs.values()
-    )
+    for spec in universe.specs.values():
+        filled = spec.filled()
+        if rates is not None and {"financing", "carry"} & set(filled.active_costs):
+            return True
+        if "borrow" in filled.active_costs and filled.borrow_rate:
+            return True
+    return False
 
 
 def _resolve_currencies(account_currency, base_currency, spec_kwargs, instruments):

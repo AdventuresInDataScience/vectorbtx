@@ -194,6 +194,57 @@ class Portfolio(_Portfolio):
                 flat[:, i] += frame[col].to_numpy(dtype=float)
         return self.wrapper.wrap(flat, group_by=False, **(wrap_kwargs or {}))
 
+    def total_profit(self, group_by=None, wrap_kwargs=None, engine=None):
+        """Total profit, with Section G's holding costs included, as `cash_flow` has them.
+
+        ⚠️ **Without this override, holding costs reach the equity curve but not the
+        totals.** Upstream computes `total_profit` straight from the order records and the
+        close (`dispatch.total_profit`), not from `cash_flow`, so the charges folded in
+        there never reach it. `final_value` (`init_cash + total_profit`), `total_return`
+        (`total_profit / init_cash`) and the `End Value` and `Total Return [%]` rows of
+        `pf.stats()` are all derived from it. A carry-paying portfolio therefore reported
+        its result before carry in those four places, while `value()`, `returns()`,
+        Sharpe, drawdown and `returns_stats()` reported it after carry, all in one tear
+        sheet (OpenStrategy Studio issue 15). With the charges added here,
+        `final_value()` equals `value()[-1]` again.
+
+        Built like `cash_flow`: only the ungrouped branch adds the charges, because
+        upstream's grouped branch re-enters this method with `group_by=False` and then
+        sums per group. Adding them in both branches would double-count.
+
+        ⚠️ Unlike upstream's, this method is not decorated with `@cached_method`. The
+        decorator keys its cache on the function name (`__cached_total_profit`), so a
+        cached override and the cached parent it calls would share one cache slot and
+        recurse into each other. The parent's own cache still works.
+
+        Trade-level figures stay **before holding costs**: `trades.pnl`, and every MT5
+        trade metric built from it (Total Net Profit, Gross Profit and Gross Loss,
+        Recovery Factor, the balance-curve drawdowns). A charge accrues per bar on
+        whatever is held, so it has no trade record to belong to, and MT5 likewise keeps
+        a deal's swap separate from its profit. Those metrics include fees and spread,
+        just not carry or financing; `pf.holding_costs` holds the difference.
+        """
+        from vectorbt.utils.config import merge_dicts
+
+        out = _Portfolio.total_profit(
+            self, group_by=group_by, wrap_kwargs=wrap_kwargs, engine=engine
+        )
+        costs = self._holding_costs
+        if costs is None or self.wrapper.grouper.is_grouped(group_by=group_by):
+            return out
+
+        frame = pd.DataFrame(costs)
+        # `atleast_1d`: a one-column portfolio reduces to a scalar.
+        values = np.array(np.atleast_1d(np.asarray(out, dtype=float)), copy=True)
+        for i, col in enumerate(self.wrapper.columns):
+            if col in frame.columns:
+                # ⚠️ numpy's sum, not pandas'. pandas skips NaN, so a NaN charge would
+                # give a plausible total while `value()`, which the same charge turns
+                # NaN, shows that something is wrong. The two must fail together.
+                values[i] += frame[col].to_numpy(dtype=float).sum()
+        wrap_kwargs = merge_dicts(dict(name_or_index="total_profit"), wrap_kwargs)
+        return self.wrapper.wrap_reduced(values, group_by=group_by, **wrap_kwargs)
+
     def indexing_func(self, pd_indexing_func, **kwargs):
         """Slice per-column vectorbtX state alongside upstream's fields.
 

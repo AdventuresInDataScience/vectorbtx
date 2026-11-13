@@ -274,7 +274,8 @@ Instrument(
     spread_points=None,
     slippage=None,               # float or "auto"
     slippage_max=None, slippage_coef=None,
-    financing=None,              # float or "auto"
+    financing=None,              # reserved: resolves to "auto" (rates= + financing_markup=)
+    borrow_rate=None,            # equity mode only: annual borrow fee on a short; None warns
     adv=None,
     active_costs=frozenset(),
     leverage=None, leverage_type="instrument_level",
@@ -649,9 +650,16 @@ Per-column `max_size` for a whole universe (`specs` in resolved column order). F
 for free. For reject semantics instead, pass `raise_reject=True` to the constructor.
 
 ### `vbt.x.borrowed_portion(pf)` → `DataFrame`
-Post-simulation split into borrowed vs cash-covered, from `pf.cash(free=True)` and
-`pf.asset_value()`. A cash-covered position borrows nothing; £50,000 against £10,000 cash
-borrows £40,000. This is Section G's input and a hard requirement.
+Post-simulation split into borrowed vs cash-covered: an account borrows exactly what its
+cash is overdrawn by, `max(0, -cash)`. A cash-covered position borrows nothing, and nor
+does a short sale, which adds cash; £50,000 against £10,000 of equity borrows £40,000.
+This is Section G's input and a hard requirement.
+
+Borrowing is an account's, so it is worked out per account. **Separate accounts:** each
+column is its own; `group_by=True` sums them. **A shared account:** one debit, split between
+its instruments in proportion to their long market value (shorts take none; an account that
+owes money while holding no longs splits it equally). On a 10,000 account at 2x, A holding
+12,000 and B 4,000 borrow 4,500 and 1,500; `group_by=None` gives the account's 6,000.
 
 Also `pf.x.borrowed_portion()`.
 
@@ -803,6 +811,27 @@ and short another either way. Must not be merged with financing.
 ### `vbt.x.tom_next_differential(base_rate, quote_rate)` → `float`
 The tom-next differential, not an interpolated one.
 
+### `vbt.x.borrow_charge(short_value, annual_rate, day_multiplier=1, day_count=360)` → `float`
+
+The borrow fee on a short in something traded directly, for one period: `-|short_value| x
+annual_rate x day_multiplier / day_count`. **Always a charge** — only the short pays it.
+
+```python
+vbt.x.borrow_charge(36_000, 0.01, day_multiplier=1, day_count=360)   # -1.00
+vbt.x.borrow_charge(36_000, 0.01, day_multiplier=3, day_count=360)   # -3.00, the weekend
+```
+
+**It follows how the instrument is traded, not what it is.** Shorting a share, ETF, fund or
+commodity product you trade directly (`mode="equity"`) means borrowing it, and the lender
+charges for that. A CFD or spread bet borrows nothing: its short side already pays funding
+at `benchmark − markup`, so it has no borrow fee, and an index, which can only be traded
+that way, never has one. `validate_spec` rejects a `borrow_rate` outside `equity`.
+
+The rate is the instrument's `borrow_rate`, set by you: it differs by security and over
+time and no free source publishes it, so there is no default. It needs no `rates=`. A
+direct short held with no `borrow_rate` is charged nothing and warns; `borrow_rate=0.0`
+states that the borrow is free. `vbt.x.borrow_series` is the vectorised form.
+
 ### `vbt.x.day_multipliers(index, triple_day="WED", end_of_day="22:00", holidays=None)` → `ndarray`
 
 `1×` per trading day, **`3×` on the triple day** (covering the weekend, since FX spot
@@ -886,6 +915,14 @@ field is a mode flag, not a figure, so pass `pf.get_init_cash()`.
 
 **Curated subset on `pf.stats()`:** Total Net Profit, Recovery Factor, Absolute Drawdown,
 GHPR. Everything else stays on `pf.trades.stats()`, keeping the default table readable.
+
+**Holding costs are not in the trade metrics.** Every metric above is built from
+`trades.pnl`, which includes fees and spread but not carry or financing: a charge accrues
+per bar on whatever is held, so it has no trade to belong to (MT5 likewise keeps a deal's
+swap apart from its profit). The portfolio totals do include them: `total_profit`,
+`final_value`, `total_return`, and End Value and Total Return [%] in `pf.stats()`. With
+`rates=`, `pf.stats()`'s Total Net Profit therefore differs from End Value minus Start Value
+by the summed `pf.holding_costs` as well as by open positions' P&L.
 
 ### `vbt.x.aggregate(results, how="geometric", weights=None)` → `Series`
 Combines several `.stats()` outputs. `"geometric"` compounds rows whose label contains

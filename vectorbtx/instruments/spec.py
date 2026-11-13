@@ -49,7 +49,21 @@ class Instrument:
         spread_points: the **full** bid/ask gap in points. Half is charged per side.
         slippage: a fraction of price, or the keyword `"auto"`.
         slippage_max, slippage_coef: parameters for `slippage="auto"`.
-        financing: a fraction (annualised), or the keyword `"auto"` to pull from Section M.
+        financing: **reserved; leave it unset.** Financing is always the benchmark from
+            the backtest's `rates=` plus the broker's `financing_markup=`, applied to every
+            instrument alike, which is how retail brokers charge it; unset resolves to
+            `"auto"`, which means exactly that. The field is kept for a possible future
+            per-instrument cost structure, the kind professional desks negotiate and
+            retail accounts do not see. A number is not used, and warns.
+        borrow_rate: the borrow fee on a **short** position in something traded directly
+            (`mode="equity"`: a share, ETF, fund or commodity product), annualised
+            (`0.005` is 0.5% a year), charged daily on the short's market value. Shorting
+            it means borrowing the security, and the lender charges for that. CFDs and
+            spread bets have none: their short side already pays funding at
+            `benchmark - markup`. None means unknown: no fee is charged, and a warning
+            says so whenever a short is held. `0.0` states that the borrow is free. There
+            is deliberately no default rate (`docs/dev/AUDIT-G.md`, G6): it varies by
+            security and over time.
         active_costs: which cost modules apply. Empty → the mode's default stack.
         leverage: maximum leverage. None → the per-mode default.
         leverage_type: per-ticker cap, or one portfolio-wide budget.
@@ -90,6 +104,7 @@ class Instrument:
     slippage_max: Optional[float] = None
     slippage_coef: Optional[float] = None
     financing: Optional[object] = None
+    borrow_rate: Optional[float] = None
     adv: Optional[float] = None
 
     active_costs: frozenset = frozenset()
