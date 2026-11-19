@@ -569,6 +569,92 @@ def quantize_engine_size(universe, engine_size, columns, order_bars=None):
     return pd.DataFrame(out, index=frame.index)
 
 
+def _cells(value, shape) -> np.ndarray:
+    """A resolved order field (a scalar, one value per column, or a frame) as one array per cell."""
+    if value is None:
+        return np.zeros(shape)
+    if isinstance(value, (pd.DataFrame, pd.Series)):
+        value = value.to_numpy()
+    arr = np.asarray(value, dtype=float)
+    if arr.ndim == 1 and arr.shape[0] == shape[0] and shape[0] != shape[1]:
+        arr = arr[:, None]                      # one value per bar, for every column
+    return np.broadcast_to(arr, shape)
+
+
+def _floor_engine(universe, col, engine_values) -> np.ndarray:
+    """Engine-unit magnitudes rounded DOWN to the column's size step (`quantize`, float-safe).
+
+    Always down, whatever the instrument's own rounding: a size that rounded up past a limit
+    would not fit it. Below the minimum size it is zero, so no order is placed.
+    """
+    from ..modes.base import get_adapter
+    from ..quantize.quantizer import quantize
+
+    spec = universe[col].filled()
+    adapter = get_adapter(spec.mode)
+    user = adapter.from_engine_units(np.abs(np.asarray(engine_values, dtype=float)), spec)
+    floored, _ = quantize(np.asarray(user, dtype=float), spec, direction="floor")
+    return np.asarray(adapter.to_engine_units(np.asarray(floored, dtype=float), spec), dtype=float)
+
+
+def cap_to_leverage(universe, engine_size, price, columns, account, costs, partial=True) -> pd.DataFrame:
+    """Every entry cut down to what its leverage allows: a position worth at most `leverage x account`.
+
+    OpenStrategy Studio issues 32 to 34. The limit is on the position, so it is applied here, to
+    the entry sizes, and never reaches vectorbt as `max_size`, which vectorbt applies to every
+    order (closes included). `account` is the equity each entry is measured against, per fill
+    bar and column: the equity at the signal bar's close when the front door knows it (issue 33:
+    a position may grow with the account), else the starting cash.
+
+    An entry over the limit is cut to the limit rounded DOWN to the size step, allowing for the
+    spread (`slippage`) and commission (`fees`, `fixed_fees`) it pays, so an unlevered account
+    can pay for it in full and vectorbt never cuts it again to the cash, off the size step
+    (issue 34). With `partial=False` (`when_cash_short="skip"`) it is not placed at all (NaN).
+    Sizes within the limit are returned as they are.
+    """
+    frame = pd.DataFrame(engine_size)[list(columns)]
+    shape = frame.shape
+    px = pd.DataFrame(price)[list(columns)].reindex(index=frame.index).to_numpy(dtype=float)
+    slip = _cells(costs.get("slippage"), shape)
+    fees = _cells(costs.get("fees"), shape)
+    fixed = _cells(costs.get("fixed_fees"), shape)
+    money = np.asarray(account, dtype=float)
+    out = frame.to_numpy(dtype=float).copy()
+    for k, col in enumerate(columns):
+        leverage = float(universe[col].filled().leverage or 1.0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            limit = (leverage * money[:, k] - fixed[:, k]) / (px[:, k] * (1.0 + slip[:, k]) * (1.0 + fees[:, k]))
+            over = np.isfinite(out[:, k]) & np.isfinite(limit) & (np.abs(out[:, k]) > limit * (1.0 + 1e-9))
+        if not over.any():
+            continue
+        if partial:
+            floored = _floor_engine(universe, col, np.maximum(limit[over], 0.0))
+            out[over, k] = np.sign(out[over, k]) * floored
+        else:
+            out[over, k] = np.nan
+    return pd.DataFrame(out, index=frame.index, columns=list(columns))
+
+
+def _apply_ceilings(universe, engine_size, ceilings, columns) -> pd.DataFrame:
+    """Each entry no bigger than its ceiling (what an earlier run found funded), rounded down."""
+    frame = pd.DataFrame(engine_size)[list(columns)]
+    roof = pd.DataFrame(ceilings).reindex(index=frame.index, columns=list(columns)).to_numpy(dtype=float)
+    out = frame.to_numpy(dtype=float).copy()
+    for k, col in enumerate(columns):
+        has = np.isfinite(roof[:, k]) & np.isfinite(out[:, k])
+        if not has.any():
+            continue
+        floored = _floor_engine(universe, col, roof[has, k])
+        out[has, k] = np.sign(out[has, k]) * np.minimum(np.abs(out[has, k]), floored)
+    return pd.DataFrame(out, index=frame.index, columns=list(columns))
+
+
+def _same_frame(a, b) -> bool:
+    """Two size frames equal, NaN with NaN."""
+    return bool(np.array_equal(pd.DataFrame(a).to_numpy(dtype=float), pd.DataFrame(b).to_numpy(dtype=float),
+                               equal_nan=True))
+
+
 def _spread(value, price, columns) -> pd.DataFrame:
     """Broadcast a scalar, per-column list or frame across the price frame."""
     if isinstance(value, pd.DataFrame):
@@ -925,6 +1011,8 @@ def prepare(
     allow_partial=True,
     risk_basis=None,
     order_bars=None,
+    leverage_basis=None,
+    ceilings=None,
     # everything else
     spec_kwargs=None,
     passthrough=None,
@@ -946,12 +1034,18 @@ def prepare(
             which columns were converted when `base_currency` is not given.
         point_fx: the rate each column was converted at, per bar, so that everything in
             points (stops, targets, trails, the spread) is in the account currency.
-        allow_partial: whether a cash-short order is partially filled (True) or skipped
-            (False). Only changes what the cash-constraint warning says.
+        allow_partial: whether an entry bigger than its leverage allows is cut down to
+            the limit (True) or not placed (False); the same for vectorbt's cash check.
         risk_basis: the money `risk_pct` is a fraction of, per fill bar and column, when
             it is not `init_cash` (see `resolve_size`).
         order_bars: boolean frame of the bars an order is placed on (the shifted entries).
             The sizing warnings measure only those. None measures every bar.
+        leverage_basis: the equity each entry's leverage limit is measured against, per
+            fill bar and column (the equity at the signal bar's close). None measures it
+            against `init_cash` (see `cap_to_leverage`).
+        ceilings: the most each entry may be, per fill bar and column, in engine units, as
+            the front door found it funded on an earlier run (`_cash_ceilings`); NaN for
+            none. Rounded down to the size step here.
 
     Returns:
         dict with `universe`, `strategy`, `columns`, `price`, `fill_price`, `size`,
@@ -1007,34 +1101,56 @@ def prepare(
         risk_basis=risk_basis, order_bars=order_bars,
     )
     engine_size = quantize_engine_size(universe, engine_size, columns, order_bars=order_bars)
+    asked = engine_size
 
-    equity = init_cash if init_cash is not None else None
-    resolved = universe.resolve(
-        fill,
-        rates=rates,
-        equity=equity,
-        fx_table=fx,
-        base_currency=base_currency,
-        volume=volume,
-        size=engine_size,
-        notional=_notional_of(engine_size, fill, weights, init_cash, columns),
-        fx_markup=per_column_fx_markup(
-            universe, columns, fx_markup,
-            base_currency if base_currency is not None else fx_markup_currency,
-        ),
-        point_fx=point_fx if point_fx is not None else pd.DataFrame(1.0, index=fill.index,
-                                                                    columns=columns),
-    )
+    def resolved_for(sizes):
+        # ⚠️ No `equity=`, so no `max_size` (OpenStrategy Studio issue 32). vectorbt applies
+        # `max_size` to EVERY order, the one that closes a position included: an exit worth more
+        # than leverage x the starting cash at its price was cut short, and a remainder under the
+        # minimum size was never sold, which blocked every later entry. The leverage limit is a
+        # limit on the position, so it is applied to the entries, below (`cap_to_leverage`).
+        return universe.resolve(
+            fill,
+            rates=rates,
+            equity=None,
+            fx_table=fx,
+            base_currency=base_currency,
+            volume=volume,
+            size=sizes,
+            notional=_notional_of(sizes, fill, weights, init_cash, columns),
+            fx_markup=per_column_fx_markup(
+                universe, columns, fx_markup,
+                base_currency if base_currency is not None else fx_markup_currency,
+            ),
+            point_fx=point_fx if point_fx is not None else pd.DataFrame(1.0, index=fill.index,
+                                                                        columns=columns),
+        )
+
+    resolved = resolved_for(engine_size)
+    if engine_size is not None and (init_cash is not None or leverage_basis is not None):
+        # The leverage limit, on the entries only, measured against the equity at the signal
+        # bar when the front door knows it (issue 33), rounded down to the size step and
+        # allowing for the spread and commission, so vectorbt never has to cut the order to
+        # the cash itself (issue 34).
+        account = _account_money(fill.index, columns, init_cash, leverage_basis)
+        engine_size = cap_to_leverage(universe, engine_size, fill, columns, account, resolved,
+                                      partial=allow_partial)
+        if ceilings is not None:
+            engine_size = _apply_ceilings(universe, engine_size, ceilings, columns)
+        if not _same_frame(engine_size, asked):
+            # Size-dependent costs (a minimum commission, automatic slippage) follow the sizes
+            # actually ordered.
+            resolved = resolved_for(engine_size)
     if engine_size is not None:
         # Sizes are already quantized above, so the engine must not floor them again —
-        # doing so would knock a clean multiple down one further increment.
+        # doing so would knock a clean multiple down one further increment, and its floor
+        # would apply to the orders that close a position too (`sell_nb` floors a close).
         resolved["size_granularity"] = np.nan
     order_kwargs = collision_check(resolved, passthrough)
 
-    warn_if_cash_constrained(universe, engine_size, fill, columns, init_cash,
+    warn_if_cash_constrained(universe, asked, fill, columns, init_cash,
                              partial=allow_partial, order_bars=order_bars,
-                             risk_basis=risk_basis if (risk_pct is not None
-                                                       or notional_pct is not None) else None)
+                             basis=leverage_basis)
 
     return dict(
         universe=universe,
@@ -1097,7 +1213,7 @@ def per_column_fx_markup(universe, columns, fx_markup, account_currency=None):
 
 
 def warn_if_cash_constrained(universe, engine_size, price, columns, init_cash,
-                             partial=True, order_bars=None, risk_basis=None) -> None:
+                             partial=True, order_bars=None, basis=None) -> None:
     """Warn when a position exceeds even the **levered** buying power.
 
     Leverage is funded, not merely capped — `vectorbtx.margin.buying_power` hands the
@@ -1105,22 +1221,23 @@ def warn_if_cash_constrained(universe, engine_size, price, columns, init_cash,
     — so a position within its leverage limit is filled in full. What remains possible is
     asking for more than the leverage itself allows.
 
-    ⚠️ That case is still a **partial fill, not a rejection**: `max_size` clips rather
-    than refusing (`allow_partial` defaults to True), and `buy_nb` then bounds what is
-    left by the buying power. Either way the order comes back smaller than requested, the
-    backtest runs, and the equity curve looks plausible. Hence the warning, naming the
-    shortfall. Pass `raise_reject=True` for reject semantics instead.
+    ⚠️ That case is a **cut, not a rejection**, by default: `cap_to_leverage` cuts the entry
+    down to the limit, rounded down to the size step (`when_cash_short="partial"`), or does
+    not place it (`"skip"`). Either way the backtest runs with smaller positions than asked,
+    and the equity curve looks plausible. Hence the warning, naming the shortfall. Only the
+    entries are cut: an exit always closes the whole position (OpenStrategy Studio issue 32).
 
     ⚠️ **Only the bars an order is placed on are measured** (`order_bars`). A size is
     resolved for every bar, and a stake or risk size is the same on each, so taking the
     largest value over the whole history named a figure no trade ever reached — the stake
     times the highest price in ten years — and reported an early, correctly sized trade as
     cut down once the price rose (OpenStrategy Studio issue 22). The warning names the
-    largest order that does not fit, and its date. With `risk_basis` (sizing from the
-    balance or equity) each order is measured against that account size times the
-    leverage, the funds it was sized from.
+    largest order that does not fit, and its date. With `basis` (the equity at each signal
+    bar, which the front door works out from the simulation) each order is measured against
+    that equity times the leverage, as `cap_to_leverage` measures it (issue 33); without it,
+    against the starting cash.
     """
-    if engine_size is None or (init_cash is None and risk_basis is None):
+    if engine_size is None or (init_cash is None and basis is None):
         return
     columns = list(columns)
     frame = pd.DataFrame(engine_size).reindex(columns=columns)
@@ -1131,8 +1248,8 @@ def warn_if_cash_constrained(universe, engine_size, price, columns, init_cash,
         placed = placed.fillna(False).to_numpy(dtype=bool)
         notional = np.where(placed, notional, np.nan)
 
-    if risk_basis is not None:
-        own = pd.DataFrame(risk_basis).reindex(index=frame.index, columns=columns)
+    if basis is not None:
+        own = pd.DataFrame(basis).reindex(index=frame.index, columns=columns)
         own = own.to_numpy(dtype=float)
     else:
         # init_cash may be per column when the pools are separate.
@@ -1166,11 +1283,10 @@ def warn_if_cash_constrained(universe, engine_size, price, columns, init_cash,
         )
         return
     warnings.warn(
-        f"Sized positions exceed their funded buying power ({detail}). These orders will "
-        f"be PARTIALLY FILLED at a smaller "
-        f"size than requested rather than rejected, so the backtest will run and quietly "
-        f"understate the position. Raise `leverage`, reduce the size, or pass "
-        f"`raise_reject=True` to reject instead of partially filling.",
+        f"Sized positions exceed their funded buying power ({detail}). These entries are "
+        f"CUT DOWN to what the leverage funds (rounded down to the size step) rather than "
+        f"rejected, so the backtest will run and quietly understate the position. Raise "
+        f"`leverage`, reduce the size, or pass when_cash_short='skip' to place nothing instead.",
         stacklevel=3,
     )
 

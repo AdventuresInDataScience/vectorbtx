@@ -170,7 +170,10 @@ def PortfolioBacktest(
             scores (higher first, aligned with the signals and shifted with them), or
             `"random"` (seeded by `seed=`).
         when_cash_short: `"skip"` (the default under shared cash) or `"partial"` — what an
-            order the cash cannot cover does. Maps to vectorbt's `allow_partial`.
+            entry bigger than its leverage allows (a position worth more than `leverage x` the
+            equity at its signal bar), or than the cash can cover, does: cut down to what is
+            funded, rounded down to the size step, or not placed. Maps to vectorbt's
+            `allow_partial` for the cash. An exit always closes the whole position.
         **kwargs: anything else, forwarded to the underlying vectorbt constructor.
 
     Returns:
@@ -337,8 +340,9 @@ def PortfolioBacktest(
         order_bars = pd.DataFrame(False, index=close.index, columns=close.columns)
         order_bars.iloc[0] = True
 
-    def prepared(risk_basis=None):
-        """The whole resolution pipeline, for one account basis of `risk_pct`."""
+    def prepared(risk_basis=None, leverage_basis=None, ceilings=None):
+        """The whole resolution pipeline, for one account basis of `risk_pct`, one equity the
+        leverage limit is measured against, and the entries' funded ceilings (see `_settle`)."""
         return prepare(
             close,
             fill_price=open,
@@ -359,6 +363,8 @@ def PortfolioBacktest(
             allow_partial=bool(sim_kwargs.get("allow_partial", True)),
             risk_basis=risk_basis,
             order_bars=order_bars,
+            leverage_basis=leverage_basis,
+            ceilings=ceilings,
             spec_kwargs=spec_kwargs,
             passthrough=passthrough,
         )
@@ -568,9 +574,14 @@ def PortfolioBacktest(
                                  stacklevel=5)
         return pf
 
-    if risk_of == "init_cash" or strategy != "signals":
+    sized = any(v is not None for v in (risk_pct, risk_amount, stake, notional, size, notional_pct))
+    if strategy != "signals" or not sized or init_cash is None:
         return simulated(prepared())
-    return _sized_from_the_account(prepared, simulated, risk_of, init_cash, order_bars)
+    # Every sized rule strategy settles its entries against the account as the run goes: the
+    # leverage limit against the equity at each signal bar (issue 33), a share of the balance or
+    # equity (`risk_of`), and an entry vectorbt had to cut to the cash re-asked at what was
+    # funded, on the size step (issue 34). A run where none of that binds is simulated once.
+    return _settle(prepared, simulated, risk_of, order_bars, bool(sim_kwargs.get("allow_partial", True)))
 
 
 def _wants_holding_costs(universe, rates) -> bool:
@@ -669,25 +680,36 @@ def _drop_rejected(signals, sides, rejected, close) -> dict:
     return out
 
 
-def _sized_from_the_account(prepared, simulated, risk_of, init_cash, order_bars):
-    """Size every entry from the balance or equity at its signal bar (`risk_of`).
+def _settle(prepared, simulated, risk_of, order_bars, partial):
+    """Settle every entry against the account as the run goes, then return the backtest.
 
-    The account at an entry depends on every fill, cost and stop before it, so the sizes
-    cannot be worked out before the simulation, and vectorbt's signal callback cannot see
-    cash. So the backtest is run, each entry is re-sized from that run's account at its
-    signal bar, and it is run again, until no entry's size changes.
+    Three things about an entry depend on every fill, cost and stop before it, so none can be
+    worked out before the simulation, and vectorbt's signal callback cannot see the cash:
 
-    It ends, and exactly: a size depends only on the account at the bar before it, so a
-    run whose first k entries are sized right sizes entry k + 1 right on the next, and
+    * its size, when it is a share of the balance or equity (`risk_of`);
+    * its leverage limit, a position worth at most `leverage x` the equity at the signal bar
+      (OpenStrategy Studio issue 33; `cap_to_leverage`);
+    * what an account can pay for, when vectorbt had to cut an entry to the cash (a levered
+      account's loan is fixed at the start, a shared account's cash is spoken for), which it
+      does off the size step: such an entry is asked again at what was funded, rounded down to
+      the size step, and kept there while the account at its signal bar stays the same
+      (issue 34; `_cash_ceilings`).
+
+    So the backtest is run, each entry is settled from that run's account at its signal bar,
+    and it is run again, until no entry's size changes. A run where nothing binds (a size from
+    the starting cash, far inside its leverage, never short of cash) is simulated once.
+
+    It ends, and exactly: each of the three depends only on the account at the bar before the
+    entry, so a run whose first k entries are settled settles entry k + 1 on the next, and
     never undoes the first k. There are at most as many runs as entry bars, plus one; in
-    practice two to four, because a change in one trade's size moves the next by only
-    about `risk_pct` of the change in its P&L.
+    practice two to four.
 
-    Warnings are recorded on each run and those of the final one re-issued, so each is
-    said once, about the backtest returned.
+    Warnings are recorded on each run and those of the final one re-issued, so each is said
+    once, about the backtest returned.
     """
     placed = order_bars.to_numpy(dtype=bool)
     limit = int(placed.any(axis=1).sum()) + 2
+    kept = {}
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -696,23 +718,74 @@ def _sized_from_the_account(prepared, simulated, risk_of, init_cash, order_bars)
     said = list(caught)
 
     for _ in range(limit):
-        basis = account_basis(pf, risk_of)
+        equity = account_basis(pf, "equity")
+        basis = None if risk_of == "init_cash" else (equity if risk_of == "equity" else account_basis(pf, risk_of))
+        ceilings = _cash_ceilings(pf, ctx["size"], placed, equity, kept) if partial else None
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            following = prepared(basis)
+            following = prepared(basis, equity, ceilings)
             if _same_sizes(following["size"], ctx["size"], placed):
                 break
             pf = simulated(following)
         ctx, said = following, list(caught)
     else:  # pragma: no cover - impossible by the argument above
         raise RuntimeError(
-            f"Sizing from the {risk_of} did not settle after {limit} runs. Please report "
-            f"this: each size depends only on earlier bars, so it should."
+            f"The entries did not settle after {limit} runs. Please report this: each one "
+            f"depends only on earlier bars, so they should."
         )
 
     for item in said:
         warnings.warn_explicit(item.message, item.category, item.filename, item.lineno)
     return pf
+
+
+def _opened_sizes(pf) -> np.ndarray:
+    """The size each order opened, per bar and column, in engine units; NaN where none opened.
+
+    An order from flat opens all of itself; one that reverses a position opens what is left
+    after the close. Read from the order records in each column's own sequence, so an entry
+    stopped out later in its own bar (split bars) still counts what it opened.
+    """
+    records = pf.orders.values
+    n, m = len(pf.wrapper.index), len(pf.wrapper.columns)
+    out = np.full((n, m), np.nan)
+    position = np.zeros(m)
+    for r in np.lexsort((np.arange(len(records)), records["idx"], records["col"])):
+        col, i = int(records["col"][r]), int(records["idx"][r])
+        q = records["size"][r] if records["side"][r] == 0 else -records["size"][r]
+        before, after = position[col], position[col] + q
+        if abs(after) < 1e-12:
+            after = 0.0
+        if after != 0.0 and (before == 0.0 or np.sign(after) != np.sign(before)):
+            out[i, col] = abs(after)
+        position[col] = after
+    return out
+
+
+def _cash_ceilings(pf, asked, placed, equity, kept) -> pd.DataFrame:
+    """The most each entry may be asked for on the next run, as this run found it funded.
+
+    An entry that opened less than it asked was cut by vectorbt to the cash, off the size step:
+    its ceiling is what it opened (`prepare` rounds it down to the step). A ceiling found on an
+    earlier run is kept while the equity at that entry's signal bar is unchanged, because the
+    entry then sees the same account; when the account before it has changed, it is asked
+    afresh. `kept` carries the ceilings from run to run: {(bar, column): (ceiling, equity)}.
+    """
+    opened = _opened_sizes(pf)
+    wanted = np.abs(pd.DataFrame(asked).to_numpy(dtype=float))
+    account = pd.DataFrame(equity).to_numpy(dtype=float)
+    out = np.full(wanted.shape, np.nan)
+    for (i, k), (roof, seen) in list(kept.items()):
+        if np.isclose(account[i, k], seen, rtol=1e-12, atol=0.0):
+            out[i, k] = roof
+        else:
+            del kept[(i, k)]
+    with np.errstate(invalid="ignore"):
+        cut = placed & np.isfinite(opened) & np.isfinite(wanted) & (opened < wanted * (1.0 - 1e-9))
+    for i, k in zip(*np.nonzero(cut)):
+        out[i, k] = opened[i, k] if np.isnan(out[i, k]) else min(out[i, k], opened[i, k])
+        kept[(int(i), int(k))] = (out[i, k], account[i, k])
+    return pd.DataFrame(out, index=pf.wrapper.index, columns=pf.wrapper.columns)
 
 
 def _same_sizes(new, old, placed) -> bool:

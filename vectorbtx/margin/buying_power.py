@@ -28,8 +28,10 @@ Two things this buys beyond correct sizing:
 * **`borrowed_portion` becomes exact and non-trivial.** `max(0, -cash)` is the drawn loan
   by construction. Previously a long could never exceed cash, so it was always ~zero and
   Section G's leverage financing barely fired.
-* **`max_size` reverts to being what it was meant to be** — a cap that binds because the
-  user set a leverage limit, not because they ran out of money.
+* **The leverage limit is what it was meant to be** — a cap that binds because the user
+  set a leverage limit, not because they ran out of money. The front door applies it to the
+  entries (`frontend.prepare.cap_to_leverage`), never as vectorbt's `max_size`, which cuts
+  every order, the ones that close a position included (OpenStrategy Studio issue 32).
 
 **What is still not modelled** (unchanged by this, and deferred by D2): maintenance
 margin, margin calls, and forced liquidation. A position can draw the whole loan and sit
@@ -70,7 +72,7 @@ def buying_power(universe, init_cash, columns, cash_sharing: bool = False):
     Notes:
         With cash sharing there is one pot, so there is one leverage: the **maximum**
         across the group. Warned about when the columns disagree, because the per-column
-        `max_size` caps still bind individually — the group can fund a 30x position in the
+        leverage limits still bind each column's entries — the group can fund a 30x position in the
         one instrument allowed 30x, and the others remain capped where they were. That is
         the intended reading, but it is worth saying out loud.
 
@@ -105,8 +107,8 @@ def buying_power(universe, init_cash, columns, cash_sharing: bool = False):
     if not np.allclose(leverage, lev):
         warnings.warn(
             f"Columns share cash but declare different leverage ({dict(zip(columns, leverage))}). "
-            f"The shared pot is funded at the maximum, {lev}x; each column's own max_size cap "
-            f"still binds it individually. If you meant one portfolio-wide budget, set "
+            f"The shared pot is funded at the maximum, {lev}x; each column's own leverage limit "
+            f"still binds its entries. If you meant one portfolio-wide budget, set "
             f"leverage_type='portfolio_level' and use Portfolio.from_weights, where the "
             f"constraint is enforced exactly on the weight matrix.",
             stacklevel=3,

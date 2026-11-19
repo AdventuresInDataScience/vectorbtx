@@ -2,7 +2,42 @@
 
 ## Unreleased
 
-The two optional parts of OpenStrategy Studio issues 23 and 26.
+The two optional parts of OpenStrategy Studio issues 23 and 26, and the leverage limit's fix
+(issues 32 to 34).
+
+### Fixed
+
+- **An exit always closes the whole position** (issue 32). The front door passed each
+  instrument's leverage limit to vectorbt as `max_size = leverage x init_cash / price` on
+  every bar, and vectorbt applies `max_size` to every order, the one that closes a position
+  included. So an exit worth more than leverage x the starting cash at its price was cut
+  short: a whole account bought at 1x sold 121.96 of 125 shares after a 3% rise, and a
+  remainder under the minimum size could never be sold, so no later entry was taken (one
+  strategy traded 4 times in 16 years instead of 333). Stops, targets and a weights book
+  selling a holding that had grown were cut the same way. `max_size` no longer reaches the
+  simulation on any route; the limit is applied to the entries instead
+  (`frontend.prepare.cap_to_leverage`). `Universe.resolve(equity=...)` and `max_size_for`
+  are unchanged for direct callers, with a warning in their docs.
+- **The leverage limit follows the equity** (issue 33). A position may be worth at most
+  `leverage x` the equity at its signal bar's close, the broker's view, not `leverage x
+  init_cash` for the whole run, which undid sizing from the balance or equity once the
+  account had grown, and cut a fixed size the grown account could pay for.
+- **A cut entry stays on the size step** (issue 34). An entry over the limit is cut to the
+  limit rounded down to the size step, allowing for the spread and commission it pays, so
+  an unlevered account can pay for it in full. When vectorbt still has to cut an entry to
+  the cash (a levered account's loan is fixed at the start; a shared account's cash is
+  spoken for), it did so off the step (66.67 shares): the entry is now asked again at what
+  was funded, rounded down. With `when_cash_short="skip"` an entry over the limit is not
+  placed.
+
+### Changed
+
+- Every sized rule strategy now settles its entries against the account as the run goes
+  (`frontend.backtest._settle`, which replaces `_sized_from_the_account`): the leverage limit
+  from the equity, `risk_of`'s balance or equity, and the cash ceilings. A run where none of
+  them binds is simulated once, exactly as before; one near its limit runs two to four
+  times. The buying-power warning measures each entry against the same equity, and says the
+  entry is cut down (or not placed) rather than partially filled.
 
 ### Added
 

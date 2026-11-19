@@ -1637,3 +1637,128 @@ def test_a_level_given_beside_the_same_leg_raises():
             _level_case(size=1, **kwargs)
     with pytest.raises(Exception, match="trail_price"):
         _level_case(size=1, trail_price=97.0, adjust_sl_func_nb=_count_calls_sl_nb, adjust_sl_args=(np.zeros(9),))
+
+
+# ############# 32, 33 and 34: the leverage limit is on the entries, from the equity, on the size step ############# #
+
+
+def _sized_orders(pf):
+    records = pf.orders.records_readable
+    index = pf.wrapper.index
+    return [(int(index.get_loc(t)), side, round(float(size), 6))
+            for t, side, size in zip(records["Timestamp"], records["Side"], records["Size"])]
+
+
+def _held_at_end(pf):
+    return round(float(np.asarray(pf.assets()).ravel()[-1]), 9)
+
+
+def test_an_exit_closes_the_whole_position_after_a_rise():
+    """Issue 32: 100 shares at 100, a whole account at 1x; at 100.5 the old cap (10,000 / 100.5 = 99.50
+    shares) cut the exit and left 0.4975, under the minimum size, held for ever, blocking the next entry."""
+    o, h, l, c = frames([100, 100, 100, 100.5, 100.5, 100.5, 100, 100, 100, 100])
+    pf = run(o, h, l, c, instruments={"X": EQUITY}, entries=mask(c.index, ["X"], [("X", 0), ("X", 6)]),
+             exits=mask(c.index, ["X"], [("X", 2), ("X", 8)]), notional=10_000, init_cash=10_000)
+    assert _sized_orders(pf) == [(1, "Buy", 100.0), (3, "Sell", 100.0), (7, "Buy", 100.0), (9, "Sell", 100.0)]
+    assert _held_at_end(pf) == 0.0
+
+
+def test_a_stop_closes_the_whole_position_after_a_rise():
+    """A stop is an exit like any other, never cut by the leverage limit. A trailing stop 10 points
+    behind a peak of 130.5 sits at 120.5; the old cap (10,000 / 120.5 = 83 shares) cut its exit."""
+    opens = [100.0, 100.0, 130.0, 130.0, 130.0, 130.0]
+    lows = [99.5, 99.5, 129.5, 129.5, 115.0, 129.5]
+    o, h, l, c = frames(opens, lows=lows)
+    pf = run(o, h, l, c, instruments={"X": EQUITY}, entries=mask(c.index, ["X"], [("X", 0)]),
+             exits=mask(c.index, ["X"]), notional=10_000, trail_points=10, init_cash=10_000)
+    orders = _sized_orders(pf)
+    assert orders[0] == (1, "Buy", 100.0) and orders[1] == (4, "Sell", 100.0), orders
+    assert _held_at_end(pf) == 0.0
+
+
+def test_a_short_is_covered_in_full_after_a_fall():
+    o, h, l, c = frames([100, 100, 100, 60, 60, 60])
+    pf = run(o, h, l, c, instruments={"X": EQUITY}, entries=mask(c.index, ["X"]), exits=mask(c.index, ["X"]),
+             short_entries=mask(c.index, ["X"], [("X", 0)]), short_exits=mask(c.index, ["X"], [("X", 2)]),
+             notional=10_000, init_cash=10_000)
+    assert _sized_orders(pf) == [(1, "Sell", 100.0), (3, "Buy", 100.0)] and _held_at_end(pf) == 0.0
+
+
+def test_a_weights_book_sells_out_a_holding_that_grew():
+    """The weights route had the cap too: a target of 0 sold 66.67 of 100 shares bought at 100, at 150."""
+    o, h, l, c = frames([100, 100, 120, 140, 150, 150, 150, 150])
+    weights = pd.DataFrame({"X": [1.0] * 5 + [0.0] * 3}, index=c.index)
+    schedule = pd.Series([True, False, False, False, False, True, False, False], index=c.index)
+    pf = run(o, h, l, c, instruments={"X": dict(EQUITY, allow_fractional=True)}, weights=weights,
+             schedule=schedule, leverage_budget=False, init_cash=10_000)
+    assert _held_at_end(pf) == 0.0
+
+
+def test_the_leverage_limit_follows_the_equity():
+    """Issue 33: a short from 100 covered at 80 leaves 12,000; a whole-equity long at 80 is 150 shares,
+    inside 1x of 12,000. A limit of 1x the starting cash allowed 125."""
+    o, h, l, c = frames([100, 100, 90, 80, 80, 80, 80, 80])
+    pf = run(o, h, l, c, instruments={"X": EQUITY}, entries=mask(c.index, ["X"], [("X", 4)]),
+             exits=mask(c.index, ["X"]), short_entries=mask(c.index, ["X"], [("X", 0)]),
+             short_exits=mask(c.index, ["X"], [("X", 2)]), notional_pct=1.0, risk_of="equity", init_cash=10_000)
+    assert _sized_orders(pf)[-1] == (5, "Buy", 150.0)
+
+
+def test_a_fixed_size_in_an_account_that_grew_is_not_cut_to_the_starting_cash():
+    """A fixed 100 shares at 120 (12,000) after a gain of 3,000: inside 1x of the equity, so in full."""
+    o, h, l, c = frames([100, 100, 130, 130, 120, 120, 120, 120])
+    pf = run(o, h, l, c, instruments={"X": EQUITY}, entries=mask(c.index, ["X"], [("X", 0), ("X", 4)]),
+             exits=mask(c.index, ["X"], [("X", 2)]), size=100, init_cash=10_000)
+    assert [order for order in _sized_orders(pf) if order[1] == "Buy"] == [(1, "Buy", 100.0), (5, "Buy", 100.0)]
+
+
+def test_an_entry_over_the_limit_is_cut_to_the_size_step_or_skipped():
+    """Issue 34: 100 whole shares asked at 150 on 10,000 are 66 shares cut down, never 66.67; with
+    when_cash_short='skip' the entry is not placed."""
+    o, h, l, c = frames([150.0] * 6)
+    common = dict(instruments={"X": EQUITY}, entries=mask(c.index, ["X"], [("X", 0)]), exits=mask(c.index, ["X"]),
+                  size=100, init_cash=10_000)
+    with pytest.warns(UserWarning, match="CUT DOWN"):
+        assert _sized_orders(run(o, h, l, c, when_cash_short="partial", **common)) == [(1, "Buy", 66.0)]
+    with pytest.warns(UserWarning, match="NOT PLACED"):
+        assert _sized_orders(run(o, h, l, c, when_cash_short="skip", **common)) == []
+
+
+def test_a_cut_entry_allows_for_the_spread_so_it_stays_on_the_size_step():
+    """A whole account at 1x with a spread: the cut leaves room for the half spread paid at the fill,
+    so the cash covers it and vectorbt does not cut it again, off the step."""
+    o, h, l, c = frames([100.0] * 6)
+    pf = run(o, h, l, c, instruments={"X": dict(EQUITY, spread_points=1.0)}, entries=mask(c.index, ["X"], [("X", 0)]),
+             exits=mask(c.index, ["X"]), notional=10_000, init_cash=10_000)
+    (bar, side, size), = _sized_orders(pf)
+    assert side == "Buy" and size == 99.0             # 100 would cost 10,050 with the half-point half spread
+
+
+def test_an_entry_cut_to_the_cash_is_asked_again_on_the_size_step():
+    """A 2x account's loan is fixed at the start, so after a gain its cash is short of the leverage limit:
+    200 shares at 100 sold at 125 leave equity 15,000 (a limit of 30,000) but cash of 25,000. A
+    whole-account entry at 107 asks 280 shares; vectorbt cut it to the cash, 233.64, off the step. It
+    is asked again at what was funded, rounded down: 233 shares."""
+    o, h, l, c = frames([100, 100, 110, 125, 110, 107, 107, 107])
+    pf = run(o, h, l, c, instruments={"X": dict(EQUITY, leverage=2.0)},
+             entries=mask(c.index, ["X"], [("X", 0), ("X", 4)]), exits=mask(c.index, ["X"], [("X", 2)]),
+             notional_pct=2.0, risk_of="equity", init_cash=10_000)
+    assert _sized_orders(pf) == [(1, "Buy", 200.0), (3, "Sell", 200.0), (5, "Buy", 233.0)]
+
+
+def test_nothing_binding_is_simulated_once(monkeypatch):
+    """Settling costs nothing when no entry is near its limit or short of cash: one simulation."""
+    import vectorbtx.core.portfolio as module
+
+    calls = []
+    original = module.Portfolio.from_signals.__func__
+
+    def counted(cls, *args, **kwargs):
+        calls.append(1)
+        return original(cls, *args, **kwargs)
+
+    monkeypatch.setattr(module.Portfolio, "from_signals", classmethod(counted))
+    o, h, l, c = frames([100, 101, 102, 103, 104, 105, 106, 107])
+    run(o, h, l, c, instruments={"X": EQUITY}, entries=mask(c.index, ["X"], [("X", 0), ("X", 4)]),
+        exits=mask(c.index, ["X"], [("X", 2), ("X", 6)]), size=10, init_cash=10_000)
+    assert len(calls) == 1

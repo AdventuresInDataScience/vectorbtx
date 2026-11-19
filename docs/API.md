@@ -712,6 +712,8 @@ Maximum engine size at `spec.leverage`.
 Per-column `max_size` for a whole universe (`specs` in resolved column order). Feed to `Order.max_size`, which **partially fills rather than rejecting** — clip semantics
 for free. For reject semantics instead, pass `raise_reject=True` to the constructor.
 
+⚠️ vectorbt applies `max_size` to **every** order, the ones that close a position included, so a position that has grown past it is closed only in part. The front door does not use it: it applies the leverage limit to the entries itself (`frontend.prepare.cap_to_leverage`, measured against the equity at each signal bar). Use `max_size_for` only where every order is an entry.
+
 ### `vbt.x.borrowed_portion(pf)` → `DataFrame`
 Post-simulation split into borrowed vs cash-covered: an account borrows exactly what its
 cash is overdrawn by, `max(0, -cash)`. A cash-covered position borrows nothing, and nor
