@@ -136,12 +136,35 @@ def test_quantization_happens_before_target_emission():
 
 
 def test_min_trade_suppression_reports_its_drift():
+    """A trade within `min_trade` of the holding is skipped (no order) and its gap recorded."""
     idx = pd.date_range("2024-01-01", periods=3, freq="D")
     weights = pd.DataFrame({"A": [0.50, 0.505, 0.70]}, index=idx)
-    targets, drift = to_targets(weights, None, min_trade=0.05)
-    assert targets["A"].iloc[1] == pytest.approx(0.50)   # suppressed
-    assert drift["A"].iloc[1] != 0.0                     # but recorded
-    assert targets["A"].iloc[2] == pytest.approx(0.70)   # large trade goes through
+    price = pd.DataFrame({"A": [100.0, 100.0, 100.0]}, index=idx)
+    targets, drift = to_targets(weights, None, price=price, min_trade=0.05)
+    assert targets["A"].iloc[0] == pytest.approx(0.50)   # the first rebalance builds the book
+    assert np.isnan(targets["A"].iloc[1])                # 0.5 held, 0.505 wanted: no order
+    assert drift["A"].iloc[1] == pytest.approx(0.005)    # but the gap is recorded
+    assert targets["A"].iloc[2] == pytest.approx(0.70)   # 0.5 held, 0.70 wanted: trades
+
+
+def test_min_trade_compares_with_the_drifted_holding_not_the_last_target():
+    """Fixed weights never change, so comparing targets skipped nothing (issue 21). The
+    holding drifts, and the gap to it is what decides."""
+    idx = pd.date_range("2024-01-01", periods=3, freq="D")
+    weights = pd.DataFrame({"A": [0.5] * 3, "B": [0.5] * 3}, index=idx)
+    small = pd.DataFrame({"A": [100.0, 101.0, 140.0], "B": [100.0] * 3}, index=idx)
+    targets, drift = to_targets(weights, None, price=small, min_trade=0.05)
+    # Bar 1: A has drifted to 101 / 201 = 0.502, within 0.05: no order on either column.
+    assert targets.iloc[1].isna().all()
+    assert drift["A"].iloc[1] == pytest.approx(0.5 - 101 / 201)
+    # Bar 2: A at 140 is 140 / 240 = 0.583 of the book, 0.083 from target: both trade.
+    assert targets.iloc[2].tolist() == [0.5, 0.5]
+
+
+def test_min_trade_needs_the_price():
+    weights = pd.DataFrame({"A": [0.5, 0.5]})
+    with pytest.raises(ValueError, match="price"):
+        to_targets(weights, None, min_trade=0.05)
 
 
 def test_drifted_weights_normalise():

@@ -76,11 +76,19 @@ MODE_DEFAULTS = {
 #: effectively continuous, large enough to keep floating-point rounding well behaved.
 FRACTIONAL_INCREMENT = 1e-6
 
-#: Maximum leverage, per Part 8. Tiered margin is deliberately not modelled — users set a
-#: sensible maximum instead.
+#: Default leverage: what an instrument that names none is funded at. Tiered margin is
+#: deliberately not modelled — users set a sensible maximum instead.
+#:
+#: ⚠️ **Bought outright and FX spot are unlevered by default (1x).** Owning shares, or
+#: holding the currency, borrows nothing; borrowing is something a user asks for
+#: (`leverage=2` is a margin account). These were 2x, so a blank leverage on an equity
+#: strategy silently allowed a position twice the account, and the buying-power warning
+#: never fired where a cash account would have refused the trade (OpenStrategy Studio
+#: issue 24). Spread bets and CFDs default to the retail limits (ESMA/FCA): 30x FX, 10x
+#: indices and commodities, 5x single stocks.
 MAX_LEVERAGE = {
-    ("equity", None): 2.0,
-    ("fx_spot", None): 2.0,
+    ("equity", None): 1.0,
+    ("fx_spot", None): 1.0,
     ("spreadbet", "stocks"): 5.0,
     ("spreadbet", "commodities"): 10.0,
     ("spreadbet", "index"): 10.0,
@@ -89,6 +97,15 @@ MAX_LEVERAGE = {
     ("cfd", "commodities"): 10.0,
     ("cfd", "index"): 10.0,
     ("cfd", "fx"): 30.0,
+}
+
+#: The highest leverage `validate_spec` accepts without a warning, where it differs from the
+#: default. A margin account for shares or FX spot borrows up to this; above it, the
+#: warning asks the user to check their broker allows it. Spread bets and CFDs warn above
+#: their default, which is already the retail limit.
+LEVERAGE_WARNING_ABOVE = {
+    ("equity", None): 2.0,
+    ("fx_spot", None): 2.0,
 }
 
 #: Pip size for an FX pair, keyed on the **quote** currency (the second of the pair).
@@ -106,6 +123,38 @@ FX_PIP_BY_QUOTE = {"JPY": 0.01, "KRW": 0.01, "HUF": 0.01, "CLP": 0.01, "IDR": 0.
 
 #: Every other quote currency.
 FX_PIP_DEFAULT = 0.0001
+
+#: Currencies quoted in a minor unit: the code, its major currency and how many major units
+#: one minor unit is. London shares are priced in pence: Yahoo writes `GBp` for a `.L`
+#: quote, Bloomberg and the LSE `GBX`.
+#:
+#: ⚠️ `GBp` is NOT `GBP`, and the case is the only difference. Never upper-case a currency
+#: code before looking it up here: `"GBp".upper()` is sterling, a hundred times the price.
+MINOR_UNITS = {"GBp": ("GBP", 0.01), "GBX": ("GBP", 0.01)}
+
+#: Point size where it is a market convention, not a broker setting (see `fill_defaults`).
+#: An index is quoted in index points, so one point is 1.0 (the FTSE 100 at 7,500 moving to
+#: 7,501). A price written in pence moves one point per penny: also 1.0.
+INDEX_POINT = 1.0
+MINOR_UNIT_POINT = 1.0
+
+
+def minor_unit(currency):
+    """`(major currency, factor)` for a minor-unit code such as `GBp`, else None."""
+    if currency is None:
+        return None
+    text = str(currency)
+    if text in MINOR_UNITS:
+        return MINOR_UNITS[text]
+    if text.upper() == "GBX":
+        return MINOR_UNITS["GBX"]
+    return None
+
+
+def major_currency(currency):
+    """The currency a code is denominated in: `GBP` for `GBp` or `GBX`, else the code."""
+    found = minor_unit(currency)
+    return found[0] if found is not None else currency
 
 
 #: Which weekday carries the weekend roll, by asset class.
@@ -217,8 +266,16 @@ def mode_defaults(mode: str) -> dict:
 
 
 def max_leverage(mode: str, asset_class=None) -> float:
-    """Default maximum leverage for a mode and asset class."""
+    """Default leverage for a mode and asset class: 1x bought outright and on FX spot, the
+    retail limit on spread bets and CFDs. See `MAX_LEVERAGE`."""
     return _lookup(MAX_LEVERAGE, mode, asset_class)
+
+
+def leverage_warning_above(mode: str, asset_class=None) -> float:
+    """The leverage above which `validate_spec` warns. See `LEVERAGE_WARNING_ABOVE`."""
+    if (mode, None) in LEVERAGE_WARNING_ABOVE:
+        return LEVERAGE_WARNING_ABOVE[(mode, None)]
+    return max_leverage(mode, asset_class)
 
 
 def fx_pip(quote_currency=None) -> float:
@@ -272,6 +329,18 @@ def fill_defaults(spec):
     # This is what lets a mixed book — EURUSD alongside USDJPY — share one set of terms.
     if spec.point_size is None and asset_class == "fx" and spec.quote_currency is not None:
         changes["point_size"] = fx_pip(spec.quote_currency)
+
+    # ⚠️ The point is a market convention too, so it is derived where the market fixes it,
+    # like the pip. An index spread bet or CFD is quoted in index points: the mode's 0.01
+    # made a 50-point stop a 0.50 move, 100 times tighter than meant, and a stake per point
+    # 100 times larger (OpenStrategy Studio issue 25). A price written in pence moves one
+    # point per penny, which is 1.0 in that price; 0.01 made it a hundredth of a penny.
+    # Commodities stay at the mode's 0.01: their point is broker-specific (spot gold is
+    # often quoted in points of 0.1), so name it per instrument.
+    elif spec.point_size is None and asset_class == "index":
+        changes["point_size"] = INDEX_POINT
+    elif spec.point_size is None and asset_class != "fx" and minor_unit(spec.quote_currency):
+        changes["point_size"] = MINOR_UNIT_POINT
 
     # The triple day follows the ASSET CLASS, not the mode: an FX spread bet rolls on
     # Wednesday (T+2 settlement) while an index spread bet rolls on Friday (calendar

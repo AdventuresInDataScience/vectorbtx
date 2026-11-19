@@ -2,6 +2,109 @@
 
 ## Unreleased
 
+OpenStrategy Studio issues 21 to 29 (its `docs/UPSTREAM.md`).
+
+### ⚠️ Changes results
+
+- **Points on a price converted to the account currency are in the instrument's own
+  price** (issue 29, found while fixing 25). A point is a unit of the native price (a cent
+  on a USD share), but the front door applied `point_size` to the converted price, so on a
+  USD share in a GBP account at 0.8 a 50-point stop sat 50 pence away instead of 50 cents
+  (62.5 cents), risk sizing over it bought 200 shares where 250 risk the amount, and a
+  1-point spread cost a penny instead of a cent. Wrong by the FX rate, silently, on every
+  converted equity or FX spot column with a stop, target or trail in points or a spread.
+  The front door now reads the rate each bar was converted at (`ConvertedFrame.fx_rate`,
+  or `attrs["fx_rate"]` on a converted Series, which `to_base_currency` now sets) and
+  prices every point at `point_size x rate`. Unconverted prices are unchanged.
+
+- **Bought outright and FX spot are unlevered by default** (issue 24). An `equity` or
+  `fx_spot` instrument that names no `leverage` was funded at 2x, a margin account, so a
+  blank leverage silently allowed a position twice the account and the buying-power
+  warning never fired where a cash account would have refused the trade. The default is
+  now 1x: owning shares, or holding the currency, borrows nothing. Pass `leverage=2` for a
+  margin account (`validate_spec` warns only above 2x, as before). Spread bets and CFDs
+  keep the retail limits: 30x FX, 10x indices and commodities, 5x single stocks. Any
+  backtest that relied on the 2x default, including a `leverage_type="portfolio_level"`
+  budget with no leverage named, now funds 1x.
+- **An index's point is 1.0, and a price in pence moves one point per penny** (issue 25).
+  `asset_class="index"` with no `point_size` got the mode's 0.01, so a 50-point stop on an
+  index spread bet was a 0.50 move, 100 times tighter than meant, and a stake per point
+  100 times larger. A share quoted in pence (`GBp`, Yahoo's `.L` quotes, or `GBX`) got
+  0.01, a hundredth of a penny. Both now default to 1.0, like the FX pip, which already
+  followed the quote currency. Commodities keep 0.01 (broker-specific; name it). Pence is
+  financed at sterling's rate, a `GBp` column in a GBP account pays no FX markup, and
+  `to_base_currency` converts pence to pounds at 0.01 (and to anything else through
+  sterling) where it used to raise for want of a `GBp` rate. A stated `point_size` is never
+  overridden.
+- **A per-bar `sl_stop` or `tp_stop` is shifted with the signals** (issue 26). vectorbt
+  reads a per-bar stop at the fill bar, and the front door did not shift it, so a stop
+  worked out at the signal bar's close (`3 * atr`) and aligned with the signals, as the
+  signals are, was read a bar late, including that bar's high, low and close: lookahead.
+  A DataFrame (or a Series on the bar index) of `sl_stop`, `tp_stop` or `sl_trail` given
+  to the front door is now shifted like the signals; a scalar or per-column value passes
+  through unchanged. Anyone who pre-shifted a stop frame now delays it two bars.
+- **A trailing stop in points stays that many points behind the best price** (issue 27).
+  `trail_points` was converted once into a fraction of the fill price, and vectorbt's
+  trailing stop is that fraction of the best price since entry, so the distance grew with
+  the price: a 2-point trail on a long filled at 120 sat 3.33 points behind a peak of 200.
+  It flattered exactly the trades that ran furthest. The front door now installs an
+  `adjust_sl_func_nb` (`vectorbtx.frontend.trail.trail_points_nb`) that keeps the distance
+  in price, checked on the entry bar as before; it cannot be combined with a callback of
+  your own (that raises). A trailing stop in % (`sl_stop` with `sl_trail=True`) is
+  unchanged.
+- **`min_trade` skips trades** (issue 21). It compared each rebalance target with the
+  previous target and wrote the old one back, so the engine still traded from the drifted
+  holding back to it: fixed weights never change, so `min_trade` did nothing at all, and
+  moving weights only had their small changes frozen. It now compares each target with the
+  weight the holding has drifted to just before the rebalance and gives a column within
+  `min_trade` of it no order, recording the gap as suppressed drift. The first rebalance
+  always trades in full. `to_targets` estimates the holding from the drift (it now needs
+  `price=` for `min_trade`); `Portfolio.from_weights`, and so the front door, measures it
+  on the simulation, so there it is exact. Portfolios with `min_trade` place fewer orders
+  and pay less in costs. `min_trade` means a weight gap everywhere now; `docs/API.md` had
+  described a cost-benefit test.
+- **Risk sizing with no stop sizes from the leverage, instead of raising** (issue 28).
+  `risk_pct` or `risk_amount` with no stop raised. A position is now sized as if its margin
+  were the risk: at leverage `L` it is worth `risk x L`, an implied stop `1 / L` of the
+  price away (the price going to zero at 1x, 20% at 5x, 3.33% at 30x). No stop is placed,
+  so a gap past the implied stop loses more than the risk; margin calls are not modelled.
+  A warning says so on every such run.
+
+### Added
+
+- **Stops and targets per column and per bar** (issue 26). `stop_points`, `target_points`
+  and `trail_points` take a number, one value per column (a dict, a list in column order,
+  or a Series indexed by column), or a DataFrame per bar, which is aligned with the
+  signals and shifted with them. Native `sl_stop` and `tp_stop` take the same shapes.
+  `vbt.x.stop_values` and `vbt.x.stop_plan` are the resolution step. Give each leg once,
+  in points or natively, or it raises (both used to reach vectorbt and fail obscurely).
+- **Risk sizing from any stop** (issue 26). `risk_pct` and `risk_amount` read whichever
+  stop is given: `stop_points` (points x point size), `sl_stop` (the fraction x the fill
+  price) or a trailing stop's first distance, per column and per bar. An entry whose stop
+  is missing on its bar (a per-bar stop still warming up) is not placed, and a warning
+  counts them.
+- **`risk_of="init_cash" | "balance" | "equity"`** (issue 23): what `risk_pct` is a
+  fraction of. The default, `init_cash`, keeps every existing result. `balance` is cash
+  after closed trades, costs and holding costs; `equity` adds open positions marked at the
+  close. Read at the close of the signal bar. Separate accounts read their own column; a
+  shared account reads the account. vectorbt's signal callback cannot see cash, so the
+  backtest is simulated again, sized from the previous run's account, until no entry's
+  size changes; each size depends only on earlier bars, so this ends with exactly the
+  result in-simulation sizing would give, typically in two to four runs.
+  `vbt.x.account_basis` gives the figures.
+
+### Changed
+
+- **The sizing warnings measure the bars an order is placed on** (issue 22). Sizes are
+  resolved for every bar, and the buying-power and minimum-size warnings took the largest
+  value over the whole history, so a stake bought at 100 was reported as needing ten times
+  its value once the price rose tenfold, with no further trade. Both now measure only the
+  entries (shifted to their fill bar; the first bar for a sized hold), name the largest
+  order that does not fit and its date, and count "N of M entries". With `risk_of`, each
+  order is measured against the account it was sized from.
+
+## 9fa427e
+
 ### ⚠️ Changes results
 
 - **Holding costs reach `total_profit`, `final_value`, `total_return` and `pf.stats()`**

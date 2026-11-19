@@ -1,5 +1,7 @@
 """Section C — one valid spec per mode, and a test for every validation rule."""
 
+import warnings
+
 import pytest
 
 from vectorbtx.instruments.defaults import default_cost_stack, max_leverage, mode_defaults
@@ -41,11 +43,24 @@ def test_part8_sizing_defaults():
 
 
 def test_part8_leverage_defaults():
-    assert max_leverage("equity") == 2.0
-    assert max_leverage("fx_spot") == 2.0
+    """Bought outright and FX spot borrow nothing unless asked (issue 24); spread bets and
+    CFDs default to the retail limits."""
+    assert max_leverage("equity") == 1.0
+    assert max_leverage("fx_spot") == 1.0
     assert max_leverage("spreadbet", "stocks") == 5.0
     assert max_leverage("spreadbet", "commodities") == 10.0
+    assert max_leverage("spreadbet", "index") == 10.0
     assert max_leverage("cfd", "fx") == 30.0
+
+
+def test_a_margin_account_at_2x_does_not_warn_but_3x_does():
+    """The default is 1x, but a 2x margin account is ordinary: only above it is the user
+    asked to check their broker."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        Instrument(mode="equity", point_size=0.01, leverage=2.0)
+    with pytest.warns(UserWarning, match="usual maximum of 2.0"):
+        Instrument(mode="equity", point_size=0.01, leverage=3.0)
 
 
 def test_commodities_behave_exactly_as_equities_for_sizing():

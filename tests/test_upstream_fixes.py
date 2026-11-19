@@ -1061,3 +1061,395 @@ def test_templated_callback_arguments_fall_back_with_a_warning():
         run(o, h, l, c, entries=mask(c.index, ["X"], [("X", 0)]), exits=mask(c.index, ["X"]),
             instruments={"X": EQUITY}, size=1, stop_points=2, init_cash=10_000,
             adjust_sl_func_nb=_reads_an_array_sl_nb, adjust_sl_args=(vbt.Rep("high"),))
+
+
+# ############# 21. min_trade skips trades within the gap of the drifted holding ############# #
+
+
+def _sixty_forty(min_trade, n=21, every=5):
+    """A fixed 60/40 book of fractional shares, A rising 1% a bar, B flat."""
+    index = pd.bdate_range("2024-01-01", periods=n)
+    close = pd.DataFrame({"A": 100 * 1.01 ** np.arange(n), "B": np.full(n, 100.0)}, index=index)
+    instrument = dict(EQUITY, point_size=0.01, allow_fractional=True)
+    weights = pd.DataFrame({"A": 0.6, "B": 0.4}, index=index)
+    schedule = pd.Series(np.arange(n) % every == 0, index=index)
+    return run(close, close + 0.5, close - 0.5, close, instruments={"A": instrument, "B": instrument},
+               weights=weights, schedule=schedule, min_trade=min_trade, init_cash=10_000)
+
+
+def test_min_trade_skips_rebalances_smaller_than_the_threshold():
+    """Studio issue 21: the targets never change, so comparing targets skipped nothing and
+    all 8 orders were placed with min_trade=0.5. Each rebalance only trims about 1%."""
+    assert len(_sixty_forty(None).orders.records) == 8
+    assert len(_sixty_forty(0.5).orders.records) == 2          # the opening purchase only
+
+
+def test_min_trade_is_measured_on_the_simulated_holding():
+    """Every trade placed after the opening moves its column by at least min_trade of the
+    book, every skipped rebalance had a smaller gap, and the gap left is reported."""
+    pf = _sixty_forty(0.015, n=41)
+    orders = pf.orders.records_readable
+    value = pd.Series(np.asarray(pf.value()).ravel(), index=pf.wrapper.index)
+    later = orders[orders["Timestamp"] > orders["Timestamp"].min()]
+    before = value.shift(1).reindex(later["Timestamp"]).to_numpy()
+    share = (later["Size"] * later["Price"]).abs().to_numpy() / before
+    assert len(later) > 0 and (share >= 0.015 - 1e-9).all()
+    traded_bars = set(later["Timestamp"])
+    # Rebalance bars (shifted to their fill) that traded nothing carry the gap in `drift`.
+    rebalance_fills = pf.wrapper.index[1::5]
+    quiet = [t for t in rebalance_fills[1:] if t not in traded_bars]
+    assert quiet
+    assert all(0 < pf.drift.loc[t].abs().max() < 0.015 for t in quiet)
+
+
+# ############# 22. The sizing warnings measure the bars an order is placed on ############# #
+
+
+def _rising():
+    o, h, l, c = frames([100.0] * 5 + [1000.0] * 5)
+    return o, h, l, c, mask(c.index, ["X"], [("X", 1)]), mask(c.index, ["X"], [("X", 3)])
+
+
+def test_sizing_warnings_ignore_bars_with_no_order():
+    """One entry at 100, then the price goes to 1,000 with nothing traded: no warning."""
+    o, h, l, c, entries, exits = _rising()
+    for terms in (dict(mode="spreadbet", point_size=1.0, spread_points=0.0, leverage=5.0, stake=300.0),
+                  dict(EQUITY, notional=500.0)):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            run(o, h, l, c, entries=entries, exits=exits, init_cash=10_000, **terms)
+        assert not [w for w in caught if "buying power" in str(w.message)
+                    or "minimum tradeable size" in str(w.message)]
+
+
+def test_buying_power_warning_names_the_entry_that_does_not_fit_and_its_date():
+    """A 600-a-point stake at 100 is 60,000 against 50,000 of buying power: that entry,
+    not the 600,000 the stake would be worth at the later price."""
+    o, h, l, c, entries, exits = _rising()
+    with pytest.warns(UserWarning, match=r"X: 1 order\(s\), the largest needs 60,000 on 2024-01-03 but "
+                                         r"its leverage funds only 50,000"):
+        run(o, h, l, c, entries=entries, exits=exits, init_cash=10_000, mode="spreadbet",
+            point_size=1.0, spread_points=0.0, leverage=5.0, stake=600.0)
+
+
+def test_minimum_size_warning_counts_entries():
+    o, h, l, c, entries, exits = _rising()
+    with pytest.warns(UserWarning, match="X: 1 of 1 entries fall below the minimum tradeable size"):
+        run(o, h, l, c, entries=entries, exits=exits, init_cash=10_000, **dict(EQUITY, notional=50.0))
+
+
+# ############# 23. Risk sizing from the balance or the equity ############# #
+
+
+def test_risk_of_balance_and_equity_size_from_the_account_after_a_loss():
+    """1% over a 10-point stop: the first trade loses 100, so the second risks 99: 9.9."""
+    lows = [99.5] * 10
+    lows[3] = 89.0
+    o, h, l, c = frames([100.0] * 10, lows=lows)
+    entries = mask(c.index, ["X"], [("X", 1), ("X", 5)])
+    for basis, wanted in (("init_cash", [10.0, 10.0]), ("balance", [10.0, 9.9]), ("equity", [10.0, 9.9])):
+        pf = run(o, h, l, c, entries=entries, exits=mask(c.index, ["X"]), risk_pct=0.01, stop_points=10,
+                 init_cash=10_000, risk_of=basis, instruments={"X": dict(EQUITY, allow_fractional=True)})
+        buys = pf.orders.records_readable.query("Side == 'Buy'")
+        assert [round(float(s), 6) for s in buys["Size"]] == wanted, basis
+
+
+def test_balance_leaves_out_an_open_trade_and_equity_counts_it():
+    """A shared account: A is open with 1,000 of profit when B enters. The equity is 11,000,
+    so B risks 110 over a 10-point stop (11 units); the balance is still 10,000 (10 units)."""
+    index = pd.bdate_range("2024-01-01", periods=8)
+    c = pd.DataFrame({"A": [100.0, 100.0, 150.0, 200.0, 200.0, 200.0, 200.0, 200.0],
+                      "B": [100.0] * 8}, index=index)
+    o, h, l = c.copy(), c + 0.5, c - 0.5
+    entries = mask(index, ["A", "B"], [("A", 0), ("B", 3)])
+    instrument = dict(EQUITY, allow_fractional=True)
+    sizes = {}
+    for basis in ("balance", "equity"):
+        pf = run(o, h, l, c, entries=entries, exits=mask(index, ["A", "B"]), risk_pct=0.01, stop_points=10,
+                 init_cash=10_000, cash="shared", risk_of=basis, instruments={"A": instrument, "B": instrument})
+        buys = pf.orders.records_readable.query("Side == 'Buy'")
+        sizes[basis] = {str(col): round(float(s), 6) for col, s in zip(buys["Column"], buys["Size"])}
+    assert sizes == {"balance": {"A": 10.0, "B": 10.0}, "equity": {"A": 10.0, "B": 11.0}}
+
+
+def test_every_entry_is_sized_from_the_account_at_its_signal_bar():
+    """The result is the fixed point: re-sizing each entry from the returned backtest's own
+    equity, at the bar before it fills, gives exactly the size it was filled at."""
+    from vectorbtx.frontend.backtest import account_basis
+
+    rng = np.random.default_rng(11)
+    n = 300
+    index = pd.bdate_range("2024-01-01", periods=n)
+    c = pd.DataFrame({"X": 100 * np.exp(np.cumsum(rng.normal(0, 0.012, n)))}, index=index)
+    o = c.shift(1).fillna(c)
+    h, l = np.maximum(o, c) * 1.004, np.minimum(o, c) * 0.996
+    entries = pd.DataFrame({"X": rng.random(n) < 0.08}, index=index)
+    exits = pd.DataFrame({"X": rng.random(n) < 0.05}, index=index)
+    # A 5.00 stop on a price near 100: each position is about 40% of the account, so none
+    # is cut down by the cash and every size is the risk rule's.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")                 # no entry may be cash-limited
+        pf = run(o, h, l, c, entries=entries, exits=exits, risk_pct=0.02, stop_points=500, init_cash=10_000,
+                 risk_of="equity", instruments={"X": dict(EQUITY, point_size=0.01, allow_fractional=True)})
+    basis = account_basis(pf, "equity")["X"]
+    buys = pf.orders.records_readable.query("Side == 'Buy'")
+    assert len(buys) >= 6
+    assert basis.max() - basis.min() > 500           # the account moved enough to matter
+    for when, filled in zip(buys["Timestamp"], buys["Size"]):
+        wanted = 0.02 * basis[when] / 5.0
+        assert float(filled) == pytest.approx(wanted, abs=2e-6)
+
+
+def test_risk_of_needs_risk_pct():
+    o, h, l, c = frames([100.0] * 6)
+    with pytest.raises(Exception, match="risk_pct"):
+        run(o, h, l, c, entries=mask(c.index, ["X"], [("X", 1)]), exits=mask(c.index, ["X"]),
+            risk_amount=100, stop_points=10, init_cash=10_000, risk_of="equity", instruments={"X": EQUITY})
+
+
+# ############# 24. Bought outright and FX spot borrow nothing by default ############# #
+
+
+def test_a_blank_leverage_bought_outright_is_a_cash_account():
+    """150 shares at 100 on 10,000 with no leverage named: 100 are bought, not 150 (2x)."""
+    o, h, l, c = frames([100.0] * 6)
+    terms = {k: v for k, v in EQUITY.items() if k != "leverage"}
+    with pytest.warns(UserWarning, match="buying power"):
+        pf = run(o, h, l, c, entries=mask(c.index, ["X"], [("X", 1)]), exits=mask(c.index, ["X"]),
+                 instruments={"X": terms}, size=150, init_cash=10_000)
+    assert float(pf.orders.records_readable["Size"].iloc[0]) == pytest.approx(100.0, rel=1e-6)
+
+
+# ############# 25. Point sizes by market convention, and pence ############# #
+
+
+@pytest.mark.parametrize("terms, point", [
+    (dict(mode="spreadbet", asset_class="index"), 1.0),
+    (dict(mode="cfd", asset_class="index", contract_size=1.0), 1.0),
+    (dict(mode="spreadbet", asset_class="stocks", quote_currency="GBp"), 1.0),
+    (dict(mode="equity", quote_currency="GBX"), 1.0),
+    (dict(mode="equity", quote_currency="GBP"), 0.01),
+    (dict(mode="spreadbet", asset_class="commodities"), 0.01),
+    (dict(mode="spreadbet", asset_class="fx", base_currency="USD", quote_currency="JPY"), 0.01),
+    (dict(mode="spreadbet", asset_class="index", point_size=0.1), 0.1),
+])
+def test_point_size_follows_the_market(terms, point):
+    import vectorbtx as vbt
+
+    assert vbt.x.Instrument(**terms).filled().point_size == point
+
+
+def test_pence_is_financed_at_sterlings_rate_and_crosses_no_exchange():
+    from vectorbtx.frontend.prepare import per_column_fx_markup, to_universe
+    from vectorbtx.holding.callback import _rate_for
+
+    index = pd.bdate_range("2024-01-01", periods=4)
+    rates = pd.DataFrame({"GBP": 0.05, "USD": 0.04}, index=index)
+    assert np.allclose(_rate_for(rates, "GBp", index), 0.05)
+    universe = to_universe({"L": dict(mode="equity", quote_currency="GBp"),
+                            "N": dict(mode="equity", quote_currency="USD")})
+    assert per_column_fx_markup(universe, ["L", "N"], 0.005, "GBP") == {"L": 0.0, "N": 0.005}
+
+
+# ############# 26. Stops and targets per column and per bar, and risk sized from any ############# #
+
+
+def _stop_case(columns=("X",), **kwargs):
+    """Signal at bar 1, fill at bar 2's open (100); bar 3's low 97.5, bar 4's 94.5.
+
+    Returns {column: (bought, [exit orders] or None)}."""
+    lows = [99.5, 99.5, 99.5, 97.5, 94.5, 99.5, 99.5, 99.5]
+    o, h, l, c = frames([100.0] * 8, lows=lows, columns=columns)
+    pf = run(o, h, l, c, entries=mask(c.index, columns, [(k, 1) for k in columns]),
+             exits=mask(c.index, columns), instruments={k: EQUITY for k in columns}, init_cash=10_000, **kwargs)
+    readable = pf.orders.records_readable
+    out = {}
+    for k in columns:
+        mine = [order for order, col in zip(_orders(pf), readable["Column"]) if col == k]
+        buys = readable[(readable["Column"] == k) & (readable["Side"] == "Buy")]["Size"]
+        out[k] = (round(float(buys.iloc[0]), 6) if len(buys) else None, mine[1:] or None)
+    return out
+
+
+def _per_bar(values):
+    return pd.DataFrame({"X": [float(v) for v in values]}, index=pd.bdate_range("2024-01-01", periods=8))
+
+
+def test_one_stop_per_column():
+    for stops in ({"X": 2, "Y": 5}, [2, 5], pd.Series({"X": 2, "Y": 5})):
+        assert _stop_case(("X", "Y"), size=1, stop_points=stops) == {
+            "X": (1.0, [(3, "Sell", 98.0)]), "Y": (1.0, [(4, "Sell", 95.0)])}
+
+
+def test_a_stop_per_bar_is_read_at_the_signal_bar():
+    """2 at the signal bar, 5 at the fill bar: the stop is 2. Read at the fill bar, it would
+    have been worked out with that bar's high, low and close: lookahead."""
+    assert _stop_case(size=1, stop_points=_per_bar([9, 2, 5, 9, 9, 9, 9, 9])) == {"X": (1.0, [(3, "Sell", 98.0)])}
+    assert _stop_case(size=1, sl_stop=_per_bar([.09, .02, .05, .09, .09, .09, .09, .09])) == \
+        {"X": (1.0, [(3, "Sell", 98.0)])}
+    # A 9-point target from the signal bar is never reached (1 at the fill bar would be).
+    assert _stop_case(size=1, stop_points=20, target_points=_per_bar([9, 9, 1, 9, 9, 9, 9, 9])) == \
+        {"X": (1.0, None)}
+
+
+def test_risk_is_sized_from_whichever_stop_is_given():
+    """100 at risk over 2 (2 points, or 2% of 100) is 50 shares."""
+    assert _stop_case(risk_amount=100, sl_stop=0.02) == {"X": (50.0, [(3, "Sell", 98.0)])}
+    assert _stop_case(risk_amount=100, stop_points=_per_bar([9, 2, 5, 9, 9, 9, 9, 9])) == \
+        {"X": (50.0, [(3, "Sell", 98.0)])}
+    assert _stop_case(risk_amount=100, trail_points=2)["X"][0] == 50.0
+    assert _stop_case(("X", "Y"), risk_amount=100, stop_points={"X": 2, "Y": 4}) == {
+        "X": (50.0, [(3, "Sell", 98.0)]), "Y": (25.0, [(4, "Sell", 96.0)])}
+
+
+def test_an_entry_with_no_stop_distance_is_not_risk_sized():
+    """A NaN at the signal bar (an ATR warming up): no stop on that entry, and with risk
+    sizing no entry at all, said in a warning."""
+    stops = _per_bar([9, np.nan, 5, 9, 9, 9, 9, 9])
+    assert _stop_case(size=1, stop_points=stops) == {"X": (1.0, None)}
+    with pytest.warns(UserWarning, match="X: 1 of 1"):
+        assert _stop_case(risk_amount=100, stop_points=stops) == {"X": (None, None)}
+
+
+def test_a_stop_given_twice_raises():
+    for kwargs in (dict(stop_points=2, sl_stop=0.02), dict(trail_points=2, sl_stop=0.02),
+                   dict(target_points=2, tp_stop=0.02)):
+        with pytest.raises(Exception, match="once"):
+            _stop_case(size=1, **kwargs)
+
+
+# ############# 27. A trailing stop in points stays a distance behind the best price ############# #
+
+
+def test_a_trailing_stop_in_points_stays_that_far_behind_the_peak():
+    """Filled at 120, trail 2: the peak reaches 200.01 and the stop fills at 198.01, not
+    3.33 points behind it (2 / 120 of the peak)."""
+    opens = [100.0, 100.0, 120.0, 140.0, 160.0, 180.0, 200.0, 199.0, 199.0]
+    lows = [v - 0.01 for v in opens]
+    lows[7] = 190.0
+    o, h, l, c = frames(opens, [v + 0.01 for v in opens], lows, opens)
+    pf = run(o, h, l, c, entries=mask(c.index, ["X"], [("X", 1)]), exits=mask(c.index, ["X"]),
+             instruments={"X": EQUITY}, size=1, trail_points=2, init_cash=10_000)
+    assert _orders(pf) == [(2, "Buy", 120.0), (7, "Sell", 198.01)]
+
+
+def test_a_short_trailing_stop_in_points_stays_that_far_above_the_trough():
+    opens = [200.0, 200.0, 180.0, 160.0, 140.0, 120.0, 100.0, 101.0, 101.0]
+    highs = [v + 0.01 for v in opens]
+    highs[7] = 110.0
+    o, h, l, c = frames(opens, highs, [v - 0.01 for v in opens], opens)
+    none = mask(c.index, ["X"])
+    pf = run(o, h, l, c, entries=none, exits=none, short_entries=mask(c.index, ["X"], [("X", 1)]),
+             short_exits=none, instruments={"X": EQUITY}, size=1, trail_points=2, init_cash=10_000)
+    assert _orders(pf) == [(2, "Sell", 180.0), (7, "Buy", 101.99)]
+
+
+def test_trail_points_refuse_a_stop_adjusting_callback():
+    o, h, l, c = frames([100] * 6, [101] * 6, [99] * 6)
+    with pytest.raises(Exception, match="trail_points"):
+        run(o, h, l, c, entries=mask(c.index, ["X"], [("X", 0)]), exits=mask(c.index, ["X"]),
+            instruments={"X": EQUITY}, size=1, trail_points=2, init_cash=10_000,
+            adjust_sl_func_nb=_count_calls_sl_nb, adjust_sl_args=(np.zeros(8),))
+
+
+# ############# 28. Risk sizing with no stop, from the leverage ############# #
+
+
+@pytest.mark.parametrize("leverage, value", [(1.0, 100.0), (5.0, 500.0), (30.0, 3_000.0)])
+def test_risk_with_no_stop_is_worth_the_risk_times_the_leverage(leverage, value):
+    o, h, l, c = frames([100.0] * 6)
+    with pytest.warns(UserWarning, match=f"implied stop {100 / leverage:.4g}% of the price away"):
+        pf = run(o, h, l, c, entries=mask(c.index, ["X"], [("X", 1)]), exits=mask(c.index, ["X"]),
+                 risk_pct=0.01, init_cash=10_000,
+                 instruments={"X": dict(EQUITY, allow_fractional=True, leverage=leverage)})
+    buy = pf.orders.records_readable.iloc[0]
+    assert float(buy["Size"] * buy["Price"]) == pytest.approx(value)
+
+
+def test_risk_amount_with_no_stop_follows_the_same_rule():
+    o, h, l, c = frames([100.0] * 6)
+    with pytest.warns(UserWarning, match="NO STOP IS PLACED"):
+        pf = run(o, h, l, c, entries=mask(c.index, ["X"], [("X", 1)]), exits=mask(c.index, ["X"]),
+                 risk_amount=50, init_cash=10_000,
+                 instruments={"X": dict(EQUITY, allow_fractional=True, leverage=2.0)})
+    buy = pf.orders.records_readable.iloc[0]
+    assert float(buy["Size"] * buy["Price"]) == pytest.approx(100.0)
+
+
+# ############# 29. Points on a converted price are in the instrument's own price ############# #
+
+
+def _converted(prices, quote="USD", rate=0.8, low_at=None, point_size=0.01, spread_points=0.0):
+    """One instrument's OHLC converted to GBP at a flat `rate`, and its terms."""
+    import vectorbtx as vbt
+
+    index = pd.bdate_range("2024-01-01", periods=len(prices))
+    native = pd.DataFrame({"X": [float(p) for p in prices]}, index=index)
+    low = native * 0.9975
+    if low_at is not None:
+        bar, value = low_at
+        low.iloc[bar] = value
+    terms = dict(mode="equity", point_size=point_size, quote_currency=quote,
+                 spread_points=spread_points, leverage=1.0, allow_fractional=True)
+    universe = vbt.x.load_universe({"X": vbt.x.Instrument(**terms)})
+    fx = pd.Series(rate, index=index, name="USDGBP")
+    if quote == "GBp":
+        fx = pd.Series(1.0, index=index, name="GBPUSD")  # only sterling is needed
+    high = native * 1.0025
+    converted = [vbt.x.to_base_currency(f, base="GBP", fx=fx, instruments=universe, fx_markup=0.0)
+                 for f in (native, high, low, native)]
+    return converted, terms, fx
+
+
+def test_a_stop_in_points_on_a_converted_price_is_in_the_quote_currency():
+    """A 50-point (50-cent) stop on a USD share bought at 100, in a GBP account at 0.8: the
+    stop is at 99.50 dollars, 79.60 pounds. It sat at 79.50, 50 pence away."""
+    (o, h, l, c), terms, fx = _converted([100.0] * 8, low_at=(3, 99.0))
+    entries = mask(c.index, ["X"], [("X", 0)])
+    pf = run(o, h, l, c, entries=entries, exits=mask(c.index, ["X"]), instruments={"X": terms},
+             size=10, stop_points=50, account_currency="GBP", fx=fx, init_cash=10_000)
+    assert _orders(pf) == [(1, "Buy", 80.0), (3, "Sell", 79.6)]
+
+
+def test_risk_sizing_on_a_converted_price_risks_the_account_currency_amount():
+    """100 pounds over a 50-cent stop (40 pence a share at 0.8) is 250 shares, not 200."""
+    (o, h, l, c), terms, fx = _converted([100.0] * 8)
+    pf = run(o, h, l, c, entries=mask(c.index, ["X"], [("X", 0)]), exits=mask(c.index, ["X"]),
+             instruments={"X": terms}, risk_amount=100, stop_points=50, account_currency="GBP", fx=fx,
+             init_cash=100_000)
+    assert float(pf.orders.records_readable["Size"].iloc[0]) == pytest.approx(250.0)
+
+
+def test_the_spread_on_a_converted_price_is_in_the_quote_currency():
+    """A 1-point (1-cent) spread at 100 dollars buys at 100.005 dollars, 80.004 pounds."""
+    (o, h, l, c), terms, fx = _converted([100.0] * 6, spread_points=1.0)
+    pf = run(o, h, l, c, entries=mask(c.index, ["X"], [("X", 0)]), exits=mask(c.index, ["X"]),
+             instruments={"X": terms}, size=1, account_currency="GBP", fx=fx, init_cash=10_000)
+    assert float(pf.orders.records_readable["Price"].iloc[0]) == pytest.approx(80.004)
+
+
+def test_a_share_in_pence_converts_to_pounds_and_its_point_is_a_penny():
+    """500p is 5.00 pounds; a 10-point stop is 10p, at 4.90 pounds."""
+    (o, h, l, c), terms, fx = _converted([500.0] * 8, quote="GBp", rate=None, point_size=1.0,
+                                         low_at=(3, 480.0))
+    assert float(c.iloc[0, 0]) == pytest.approx(5.0)
+    pf = run(o, h, l, c, entries=mask(c.index, ["X"], [("X", 0)]), exits=mask(c.index, ["X"]),
+             instruments={"X": terms}, size=10, stop_points=10, account_currency="GBP", fx=fx,
+             init_cash=10_000)
+    assert _orders(pf) == [(1, "Buy", 5.0), (3, "Sell", 4.9)]
+
+
+def test_the_conversion_rate_survives_slicing_and_aligns_to_the_backtest():
+    import vectorbtx as vbt
+    from vectorbtx.fx.convert import fx_rate_of
+
+    index = pd.bdate_range("2024-01-01", periods=6)
+    native = pd.DataFrame({"X": 100.0, "Y": 50.0}, index=index)
+    universe = vbt.x.load_universe({"X": vbt.x.Instrument(mode="equity", point_size=0.01, quote_currency="USD"),
+                                    "Y": vbt.x.Instrument(mode="equity", point_size=0.01, quote_currency="GBP")})
+    fx = pd.Series(np.linspace(0.8, 0.85, 6), index=index, name="USDGBP")
+    converted = vbt.x.to_base_currency(native, base="GBP", fx=fx, instruments=universe, fx_markup=0.0)
+    sliced = converted.iloc[2:]
+    rate = fx_rate_of(sliced, index=sliced.index, columns=sliced.columns)
+    assert rate.index.equals(sliced.index)
+    assert np.allclose(rate["X"], fx.iloc[2:]) and np.allclose(rate["Y"], 1.0)

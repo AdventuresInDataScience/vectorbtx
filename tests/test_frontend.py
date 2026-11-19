@@ -125,10 +125,13 @@ def test_two_sizing_arguments_raise_naming_both():
     assert "stake" in str(exc.value) and "notional" in str(exc.value)
 
 
-def test_risk_sizing_without_a_stop_raises():
-    universe = to_universe(None, columns=["A"], mode="equity", point_size=0.01)
-    with pytest.raises(BacktestError, match="stop_points"):
-        resolve_size(universe, FLAT, ["A"], risk_pct=0.01, init_cash=10_000)
+def test_risk_sizing_without_a_stop_sizes_from_the_leverage_and_warns():
+    """No stop: the margin is the risk, so the position is worth R x L (issue 28)."""
+    universe = to_universe(None, columns=["A"], mode="equity", point_size=0.01, leverage=1.0)
+    with pytest.warns(UserWarning, match="NO STOP IS PLACED"):
+        sized = resolve_size(universe, FLAT, ["A"], risk_pct=0.01, init_cash=10_000)
+    value = sized["A"] * FLAT["A"]
+    assert np.allclose(value, 100.0)
 
 
 def test_risk_sizing_gives_identical_monetary_risk_across_modes():

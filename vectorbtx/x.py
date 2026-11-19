@@ -72,9 +72,9 @@ from .holding.accrual import day_multipliers
 from .metrics.aggregate import aggregate
 
 # --- front door (N) ---
-from .frontend.backtest import PortfolioBacktest
+from .frontend.backtest import PortfolioBacktest, account_basis
 from .frontend.single import SingleBacktest
-from .frontend.prepare import BacktestError
+from .frontend.prepare import BacktestError, stop_plan, stop_values
 
 __all__ = [
     "Instrument",
@@ -144,4 +144,7 @@ __all__ = [
     "PortfolioBacktest",
     "SingleBacktest",
     "BacktestError",
+    "account_basis",
+    "stop_plan",
+    "stop_values",
 ]

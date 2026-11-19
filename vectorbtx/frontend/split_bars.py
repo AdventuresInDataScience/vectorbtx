@@ -142,12 +142,21 @@ def stops_active(stops, sim_kwargs) -> bool:
 
 
 def _custom(func):
-    """True for a callback that is not one of vectorbt's own no-op defaults."""
+    """True for a user's callback: not one of vectorbt's no-op defaults, nor the front
+    door's own (`STEP_AWARE`)."""
     from vectorbt.portfolio import nb
 
-    return func is not None and func not in (
+    return func is not None and not step_aware(func) and func not in (
         nb.no_signal_func_nb, nb.no_adjust_sl_func_nb, nb.no_adjust_tp_func_nb
     )
+
+
+def step_aware(func) -> bool:
+    """True for the front door's own callbacks, which see steps and index by bar themselves
+    (`vectorbtx.frontend.trail`), so they run on every step, unwrapped."""
+    from .trail import trail_points_nb
+
+    return func is not None and func is trail_points_nb
 
 
 def can_split(sim_kwargs) -> bool:
@@ -238,7 +247,12 @@ def simulate_split_bars(cls, close, open, high, low, price, signals, call_seq=No
     for name, (args_name, kind) in ADJUST_CALLBACKS.items():
         func = kwargs.pop(name, None)
         user_args = tuple(kwargs.pop(args_name, ()))
-        if _custom(func):
+        if step_aware(func):
+            # The front door's own callbacks index by bar themselves and must run on every
+            # step (see `vectorbtx.frontend.trail`), so they are not wrapped.
+            callbacks[name] = func
+            callbacks[args_name] = user_args
+        elif _custom(func):
             callbacks[name] = bar_view(kind, func, len(user_args))
             callbacks[args_name] = user_args
         elif func is not None:

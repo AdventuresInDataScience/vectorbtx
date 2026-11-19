@@ -175,14 +175,15 @@ the same strategy both ways.
 
 ## The four instrument modes
 
-| Mode | Sized in | P&L | Min size | Increment | Max leverage |
+| Mode | Sized in | P&L | Min size | Increment | Default leverage |
 |---|---|---|---|---|---|
 | `spreadbet` | £ per point | `points × stake` | £1/pt | £0.01 | 5× / 10× / 30× |
 | `cfd` | lots | `Δprice × contract_size × lots` | 0.01 lots | 0.01 | 5× / 10× / 30× |
-| `fx_spot` | lots | `Δprice × contract_size × lots` | 0.01 lots | 0.01 | 2× |
-| `equity` | shares | `Δprice × shares` | 1 share | 1 | 2× |
+| `fx_spot` | lots | `Δprice × contract_size × lots` | 0.01 lots | 0.01 | 1× |
+| `equity` | shares | `Δprice × shares` | 1 share | 1 | 1× |
 
-Leverage tiers are stocks / commodities-and-indices / FX respectively.
+Leverage tiers are stocks / commodities-and-indices / FX respectively. Bought outright and
+FX spot borrow nothing unless asked: `leverage=2` is a margin account.
 
 **All four collapse to one engine expression**, `engine_size × Δprice`. That is what makes
 cross-mode equivalence testable:
@@ -659,10 +660,10 @@ exceeds 5%" is `calendar & threshold`.
 |---|---|---|---|
 | `validate_weights(weights)` | Warns both ways: under 1 leaves the remainder in cash (fine, often intended); over 1 is implicit leverage that must route through the budget rather than entering by the back door. | — | `apply_leverage_budget` |
 | `apply_leverage_budget(weights, universe, equity=None)` | `portfolio_level` enforcement: scales weights to fit the total notional budget. Exact and cheap, because weights are known ahead of time. | `validate_weights`, `max_leverage` | `from_weights` |
-| `to_targets(weights, schedule, universe, price, equity, min_trade)` | → `(targets, drift)`. **NaN off-schedule, never forward-filled.** Forward-filling rebalances every bar — which still runs, still looks plausible, and quietly accrues costs while producing a suspiciously smooth equity curve. | `_quantize_weights`, `_apply_min_trade`, `_warn_if_forward_filled` | `from_weights` |
+| `to_targets(weights, schedule, universe, price, equity, min_trade)` | → `(targets, drift)`. **NaN off-schedule, never forward-filled.** Forward-filling rebalances every bar — which still runs, still looks plausible, and quietly accrues costs while producing a suspiciously smooth equity curve. | `_quantize_weights`, `estimated_min_trade_skips`, `_warn_if_forward_filled` | `from_weights` |
 | `_warn_if_forward_filled(weights, mask)` | Detects the classic input error: values that change **only on rebalance bars** and are flat in between. Genuinely constant weights (equal weighting) are exempt, or the check becomes noise. | — | `to_targets` |
 | `_quantize_weights(...)` | Quantizes **before** target emission — quantizing afterwards loses the drift information. | `quantize.quantize` | `to_targets` |
-| `_apply_min_trade(...)` | Suppresses trades costing more than the drift they correct; **routes the suppressed drift through Section D's reporting** rather than letting it vanish. | — | `to_targets` |
+| `estimated_min_trade_skips(...)`, `measured_min_trade_skips(...)` | `min_trade` as a weight gap: a column within `min_trade` of the weight its holding has drifted to gets no order. Estimated from the drift in `to_targets`, measured on the simulation in `from_weights`; **the gap left is routed through Section D's reporting** rather than vanishing. | — | `to_targets`, `from_weights` |
 
 ---
 
@@ -854,8 +855,8 @@ Documented rather than hidden. Each traces to a recorded design decision.
     nor carry.
 
 Deliberately deferred: maintenance margin, margin calls and forced liquidation (F2);
-dividends for nominal-point modes; asymmetric bid/ask; compounding-equity risk sizing
-(`risk_pct` sizes off `init_cash`, since at level 1 equity is only known before the run).
+dividends for nominal-point modes; asymmetric bid/ask. (Compounding risk sizing is built:
+`risk_of="balance"` or `"equity"`.)
 
 ---
 

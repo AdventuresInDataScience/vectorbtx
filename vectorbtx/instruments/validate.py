@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 import warnings
 
-from .defaults import ASSET_CLASSES, MODES, max_leverage
+from .defaults import ASSET_CLASSES, MODES, leverage_warning_above
 
 
 class SpecError(ValueError):
@@ -105,11 +105,11 @@ def validate_spec(spec) -> None:
         raise SpecError(f"Unknown leverage_type {spec.leverage_type!r}")
     if spec.leverage is not None:
         _positive(spec.leverage, "leverage")
-        cap = max_leverage(spec.mode, spec.asset_class)
+        cap = leverage_warning_above(spec.mode, spec.asset_class)
         if spec.leverage > cap:
             warnings.warn(
                 f"leverage={spec.leverage} exceeds the {spec.mode}/{spec.asset_class} "
-                f"default maximum of {cap}. Permitted, but check your broker allows it.",
+                f"usual maximum of {cap}. Permitted, but check your broker allows it.",
                 stacklevel=3,
             )
 

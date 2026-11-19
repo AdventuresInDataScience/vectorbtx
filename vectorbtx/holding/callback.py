@@ -327,6 +327,11 @@ def _rate_for(rates, currency, index):
     """Look up a currency's rate series, or zero if none is supplied."""
     if rates is None or currency is None:
         return np.zeros(len(index))
+    # A price in pence (`GBp`, `GBX`) is financed at sterling's rate: the rate table is keyed
+    # by the major currency, and a penny earns what a pound does.
+    from ..instruments.defaults import major_currency
+
+    currency = major_currency(currency)
     frame = pd.DataFrame(rates)
     if currency not in frame.columns:
         raise ValueError(

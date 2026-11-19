@@ -153,6 +153,17 @@ class FXTable:
         Raises:
             FXError: if the pair is absent from the grid.
         """
+        # A price in a minor unit (pence: `GBp`, `GBX`) converts through its major
+        # currency: 1 GBp is 0.01 GBP. Only the exact codes count; `GBP` is sterling.
+        from ..instruments.defaults import minor_unit
+
+        for side, code in (("quote", quote), ("base", base)):
+            found = minor_unit(code)
+            if found is not None:
+                major, factor = found
+                if side == "quote":
+                    return self.get(major, base, index=index) * factor
+                return self.get(quote, major, index=index) / factor
         if quote == base:
             series = pd.Series(1.0, index=self.rates.index)
         elif (quote, base) in self.rates.columns:

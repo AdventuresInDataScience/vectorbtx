@@ -241,6 +241,9 @@ def to_base_currency(
         # markup here meant a converted single-instrument backtest never paid it.
         series.attrs["fx_markup"] = out.fx_markup
         series.attrs["base_currency"] = base
+        # The rate each bar was converted at, which turns a point (a native price unit)
+        # into the account currency for stops and the spread (`fx_rate_of`).
+        series.attrs["fx_rate"] = out.fx_rate.iloc[:, 0].rename(data.name)
         return series
     return out
 
@@ -263,6 +266,37 @@ def fx_markup_of(*frames):
             markup = getattr(frame, "attrs", {}).get("fx_markup")
         if markup is not None:
             return float(markup)
+    return None
+
+
+def fx_rate_of(*frames, index=None, columns=None):
+    """The rate a converted price frame was converted at, per bar and column, or None.
+
+    Reads `ConvertedFrame.fx_rate`, or the `attrs` entry a converted Series carries, from
+    the first frame that has one, aligned to `index` and `columns` when given (a sliced
+    ConvertedFrame carries its whole rate frame). A column with no rate (one already in
+    the account currency) gets 1.0. Call it **before** `pd.DataFrame(...)` drops both.
+
+    ⚠️ A point is a unit of the instrument's NATIVE price. Once the price is converted, a
+    move of one point is `point_size x rate` in the account currency, so every point-based
+    figure (stops, targets and trails in points, the spread) must be scaled by this rate.
+    """
+    for frame in frames:
+        if frame is None:
+            continue
+        if isinstance(frame, ConvertedFrame):
+            rate = getattr(frame, "fx_rate", None)
+        else:
+            rate = getattr(frame, "attrs", {}).get("fx_rate")
+        if rate is None:
+            continue
+        rate = pd.DataFrame(rate)
+        if columns is not None and rate.shape[1] == 1 and len(list(columns)) == 1:
+            rate = rate.set_axis(list(columns), axis=1)
+        if index is not None or columns is not None:
+            rate = rate.reindex(index=index if index is not None else rate.index,
+                                columns=list(columns) if columns is not None else rate.columns)
+        return rate.astype(float).fillna(1.0)
     return None
 
 

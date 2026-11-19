@@ -33,7 +33,7 @@ mode="fx_spot"    ──►  lots x contract size. pips, carry regardless of lev
 | `allow_fractional` | **yes** | rejected | rejected | rejected |
 | `quote_currency` | yes | n/a | yes | **required** |
 | `base_currency` (pair side) | rejected | rejected | rejected | **required** |
-| `leverage` default | 2× | 5/10/30× by asset class | 5/10/30× by asset class | 2× |
+| `leverage` default | 1× | 5/10/30× by asset class | 5/10/30× by asset class | 1× |
 | `carry` | no | fx asset class only | fx asset class only | **always** |
 | `financing` | yes | yes | yes | no |
 | `borrow_rate` (a short's borrow fee) | **yes** | rejected — funding covers the short | rejected — funding covers the short | rejected |
@@ -446,7 +446,7 @@ Not examples — the full vocabulary, for lookup.
 ### Sizing (exactly one)
 
 ```python
-risk_pct=0.01          # fraction of init_cash risked per trade; requires stop_points
+risk_pct=0.01          # fraction of the account risked per trade (risk_of)
 risk_amount=100        # absolute money at risk per trade
 stake=2.50             # instrument's own units: £/pt, lots, or shares
 notional=25_000        # target exposure per position
@@ -456,16 +456,20 @@ size=<array>           # raw passthrough, escape hatch
 Two given → error naming both. `risk_pct` and `risk_amount` are separate arguments rather
 than one `risk=` disambiguated by magnitude.
 
-⚠️ `risk_pct` sizes off `init_cash`, not compounding equity — at level 1 equity is only
-known before the simulation runs. Material over a long backtest with real drawdowns.
+`risk_of="init_cash" | "balance" | "equity"` says what `risk_pct` is a fraction of; the
+default is `init_cash`. Risk sizing reads whichever stop is given (points, `sl_stop`, a
+trailing stop's first distance); with no stop, a position is worth the risk times its
+leverage, with a warning. See `docs/API.md`.
 
 ### Stops (points, not fractions)
 
 ```python
-stop_points=60
+stop_points=60          # or {"EURUSD": 60, "SPY": 300}, or a DataFrame per bar
 target_points=120
-trail_points=40
+trail_points=40         # stays 40 points behind the best price
 ```
+
+A per-bar stop is aligned with the signals and shifted with them, like `sl_stop` frames.
 
 ### Slippage
 
@@ -519,7 +523,7 @@ Every choice in this document, and where it comes from. **Nothing here is open.*
 | `commission_*` forced to 0 in spreadbet mode | plan §E default stacks |
 | `allow_fractional` equity only | plan §C validation |
 | `price_field` defaults per mode | plan D10 |
-| Leverage defaults 2× / 5× / 10× / 30× | plan Part 8 |
+| Leverage defaults 1× / 5× / 10× / 30× (bought outright and FX spot unlevered) | plan Part 8; OpenStrategy Studio issue 24 |
 | `leverage_type` for portfolio-wide exposure | plan §F |
 | `active_costs` selects cost modules | plan §C |
 | `'auto'` for slippage and financing only | plan D8 keyword registry |

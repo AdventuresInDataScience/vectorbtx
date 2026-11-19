@@ -33,7 +33,7 @@ _FRONTEND_ARGS = frozenset(
         "stop_points", "target_points", "trail_points",
         "volume", "rates", "fx", "account_currency", "base_currency", "fx_markup",
         "min_trade", "leverage_budget", "holidays", "financing_markup", "carry_markup",
-        "cash", "entry_priority", "when_cash_short",
+        "cash", "entry_priority", "when_cash_short", "risk_of",
         *SIZING_ARGS,
         *_SPEC_FIELDS,
     }
@@ -66,6 +66,7 @@ def PortfolioBacktest(
     stake=None,
     notional=None,
     size=None,
+    risk_of=None,
     # --- stops, in points ---
     stop_points=None,
     target_points=None,
@@ -108,8 +109,22 @@ def PortfolioBacktest(
             `entries`/`exits`. Shifted to the next bar exactly like them.
         weights, schedule: target weights and rebalance mask → rebalanced strategy.
         risk_pct, risk_amount, stake, notional, size: **exactly one.** Two raises.
+            `risk_pct` and `risk_amount` size each entry to lose that risk at its stop,
+            from whichever stop is given (`stop_points`, `sl_stop` or a trailing stop's
+            first distance). With no stop, a position is worth the risk times its leverage:
+            its margin is the risk, an implied stop 1 / leverage of the price away, and no
+            stop is placed (a warning says so).
+        risk_of: what `risk_pct` is a fraction of: `"init_cash"` (the default, the same
+            amount on every trade), `"balance"` (cash after closed trades, costs and
+            holding costs so far) or `"equity"` (the balance plus open positions marked at
+            the close). Read at the close of the signal bar, the last value known when the
+            order is sent. Separate accounts read their own column; a shared account reads
+            the account. See Notes.
         stop_points, target_points, trail_points: stops in points, converted internally
-            to the native price fractions.
+            to the native price fractions. Each takes a number, one value per column (a
+            dict, or a list in column order), or a DataFrame per bar, aligned with the
+            signals and shifted with them. A trailing stop in points stays that many
+            points behind the best price.
         volume: volume frame, required by `slippage="auto"`.
         rates: benchmark rate table (Section M), required by `financing="auto"`.
         fx: an `FXTable` for converting foreign-currency fixed costs.
@@ -183,8 +198,20 @@ def PortfolioBacktest(
         Converting internally for sizing while signals ran on native prices would put two
         different price series in one backtest — worse than one visible line.
 
-        ⚠️ **`risk_pct` sizes off `init_cash`, not compounding equity.** Material over a
-        long backtest with real drawdowns.
+        **Stops given per bar are shifted with the signals**, `stop_points`, `target_points`
+        and `trail_points` frames and vectorbt's own `sl_stop`, `tp_stop` and `sl_trail`
+        frames alike: a stop worked out at the signal bar's close (`3 * atr`) is the one
+        used from the fill. vectorbt alone reads a per-bar `sl_stop` at the fill bar, a bar
+        late — lookahead. A scalar or per-column `sl_stop` passes through unchanged.
+
+        **`risk_pct` sizes off `init_cash` by default**, the same amount on every trade.
+        `risk_of="balance"` or `"equity"` sizes each entry from the account at its signal
+        bar instead. Those depend on every fill, cost and stop before the entry, so the
+        backtest is simulated again, sized from the previous run's account, until no
+        entry's size changes. Each size depends only on bars before it, so this ends, and
+        the result is exactly what sizing inside the simulation would give; it typically
+        takes two to four runs. Holding costs are charged after each run, so the balance
+        and equity include them.
 
     Examples:
         >>> pf = vbt.x.PortfolioBacktest(
@@ -219,11 +246,14 @@ def PortfolioBacktest(
     # ⚠️ Read the FX markup BEFORE coercing: `pd.DataFrame(...)` drops ConvertedFrame's
     # attributes, which is how the markup used to vanish and never be charged. Orders fill
     # at the open, so the open's markup is the one that applies.
-    from ..fx.convert import converted_currency_of, fx_markup_of
+    from ..fx.convert import converted_currency_of, fx_markup_of, fx_rate_of
 
     if fx_markup is None:
         fx_markup = fx_markup_of(open, raw_close)
     converted_to = converted_currency_of(open, raw_close)
+    # ⚠️ And the conversion rate, so a point (a unit of the native price) is priced in the
+    # account currency: stops, targets, trails and the spread (issue 29).
+    point_fx = fx_rate_of(open, raw_close, index=close.index, columns=close.columns)
     open = pd.DataFrame(open).reindex(index=close.index, columns=close.columns)
 
     if high is None or low is None:
@@ -252,207 +282,254 @@ def PortfolioBacktest(
     from .cash import resolve_cash_model, shared_call_seq
 
     sim_kwargs = dict(kwargs)
+    strategy = strategy_of(entries, exits, weights, schedule, short_entries, short_exits)
     cash = resolve_cash_model(
         cash,
-        strategy_of(entries, exits, weights, schedule, short_entries, short_exits),
+        strategy,
         sized=any(v is not None for v in (risk_pct, risk_amount, stake, notional, size)),
         sim_kwargs=sim_kwargs,
         entry_priority=entry_priority,
         when_cash_short=when_cash_short,
     )
+    risk_of = _check_risk_of(risk_of, risk_pct, risk_amount, init_cash)
 
-    ctx = prepare(
-        close,
-        fill_price=open,
-        instruments=instruments,
-        entries=entries, exits=exits, weights=weights, schedule=schedule,
-        short_entries=short_entries, short_exits=short_exits,
-        risk_pct=risk_pct, risk_amount=risk_amount, stake=stake,
-        notional=notional, size=size,
-        stop_points=stop_points, target_points=target_points, trail_points=trail_points,
-        volume=volume, rates=rates, fx=fx, base_currency=account_currency,
-        fx_markup=fx_markup, fx_markup_currency=converted_to,
-        init_cash=init_cash,
-        allow_partial=bool(sim_kwargs.get("allow_partial", True)),
-        spec_kwargs=spec_kwargs,
-        passthrough=passthrough,
-    )
-
-    from ..core.portfolio import Portfolio
-
-    universe = ctx["universe"]
-    close = ctx["price"]
-    fill = ctx["fill_price"]
-    order_kwargs = ctx["order_kwargs"]
-
-    margin_loan = None
-    engine_cash = None
-    if init_cash is not None:
-        # Fund the leverage rather than only capping it. `buy_nb` bounds every long by
-        # cash, so a levered position is unreachable unless the engine is handed the
-        # buying power; `Portfolio.get_init_cash` subtracts the loan back out so reported
-        # equity, returns and every metric stay on the account's real size.
-        from ..margin.buying_power import buying_power
-
-        # `from_weights` turns cash sharing on itself (Section J: it is load-bearing for
-        # `call_seq="auto"`), so the basis has to be decided here rather than read off
-        # whatever the caller happened to pass.
-        shares_cash = bool(
-            sim_kwargs.get("cash_sharing", ctx["strategy"] == "weights")
-        )
-        engine_cash, margin_loan = buying_power(
-            universe, init_cash, ctx["columns"], cash_sharing=shares_cash,
-        )
-        sim_kwargs["init_cash"] = engine_cash
-
-    strategy = ctx["strategy"]
-
-    if strategy == "weights":
-        if weights is None:
-            raise BacktestError("`schedule` was given without `weights`; there is nothing to target.")
-        # ⚠️ The rebalancing path is funded at EQUITY, never at buying power.
-        #
-        # `TargetPercent` is a fraction of the account value the ENGINE sees. Hand the
-        # engine `equity x leverage` and a 60/40 book on equity mode's default 2x silently
-        # becomes 120/80 — fully invested by the user's reckoning, 2x levered in fact.
-        # Rescaling the weights by 1/leverage does not fix it either: the loan is a
-        # constant while equity moves, so the ratio drifts and the book slowly
-        # under-invests.
-        #
-        # So weights mean "fraction of your equity", exactly, at every point in the run,
-        # and a book whose longs need more cash than that equity cannot fill. Rather than
-        # let vectorbt starve the last columns, `_fit_weights_to_cash` scales those rows
-        # pro rata (with a warning). Leverage belongs to the signal path, where it is funded.
-        if init_cash is not None:
-            sim_kwargs["init_cash"] = float(np.sum(np.asarray(init_cash, dtype=float)))
-            margin_loan = None
-        weights = _fit_weights_to_cash(weights, order_kwargs.get("lock_cash"))
-        pf = Portfolio.from_weights(
-            close,
-            weights,
-            schedule=_next_bar(schedule, close) if schedule is not None else None,
-            price=fill,
-            universe=universe,
-            min_trade=min_trade,
-            leverage_budget=leverage_budget,
-            order_kwargs=order_kwargs,
-            **sim_kwargs,
-        ).replace(margin_loan=margin_loan)
-    elif strategy == "signals":
-        # ⚠️ ALL FOUR signal arrays shift, not just the long pair. Short signals used to
-        # arrive in `**kwargs` and reach vectorbt unshifted, so every short filled at the
-        # open of the bar whose close produced it: lookahead on every short.
+    # ⚠️ ALL FOUR signal arrays shift, not just the long pair. Short signals used to arrive
+    # in `**kwargs` and reach vectorbt unshifted, so every short filled at the open of the
+    # bar whose close produced it: lookahead on every short. They are shifted once, here,
+    # before `prepare`, so the sizing warnings can measure the bars orders are placed on.
+    signals = None
+    order_bars = None
+    native_stops = {}
+    if strategy == "signals":
         signals = dict(
             entries=_next_bar(entries, close),
             exits=_next_bar(exits, close),
             short_entries=_next_bar(short_entries, close),
             short_exits=_next_bar(short_exits, close),
         )
-        # Point stops were converted to fractions of the fill price (the open), so they
-        # must be anchored there. vectorbt's default anchor is the entry bar's CLOSE: a buy
-        # filled at 100 on a bar closing at 103 had its 2-point stop at 100.94, above the
-        # entry. "price" is the order price before slippage — exactly what the points were
-        # converted against ("fillprice" would anchor after the spread).
-        sim_kwargs.setdefault("stop_entry_price", "price")
-        # vectorbt's default "stoplimit" applies NO slippage to a stop fill, and the spread
-        # lives in `slippage`, so every stop and target exit paid no spread. "stopmarket"
-        # charges spread plus slippage like any other fill. A take-profit is a limit order
-        # and arguably should pay the spread but not slippage; one `slippage` field cannot
-        # separate the two, so it pays both — the conservative side of the error.
-        sim_kwargs.setdefault("stop_exit_price", "stopmarket")
+        order_bars = _opening_bars(signals, close, sim_kwargs.get("direction"))
+        # vectorbt's own stops are resolved with the front door's, so a per-bar one is
+        # shifted with the signals and risk sizing can read it (issue 26).
+        native_stops = {name: sim_kwargs.pop(name) for name in ("sl_stop", "tp_stop", "sl_trail")
+                        if name in sim_kwargs}
+    elif strategy == "hold":
+        # A sized hold places one order, on the first bar (`_entry_only`).
+        order_bars = pd.DataFrame(False, index=close.index, columns=close.columns)
+        order_bars.iloc[0] = True
 
-        # ⚠️ With a stop active, every bar is simulated as its open plus the rest of the
-        # bar, so a stop is checked on the bar it was entered on. Whole bars leave the
-        # entry bar's range unchecked — always in the strategy's favour, and worst for
-        # tight stops on daily bars. See `split_bars`.
-        from .split_bars import can_split, simulate_split_bars, stops_active
+    def prepared(risk_basis=None):
+        """The whole resolution pipeline, for one account basis of `risk_pct`."""
+        return prepare(
+            close,
+            fill_price=open,
+            instruments=instruments,
+            entries=entries, exits=exits, weights=weights, schedule=schedule,
+            short_entries=short_entries, short_exits=short_exits,
+            risk_pct=risk_pct, risk_amount=risk_amount, stake=stake,
+            notional=notional, size=size,
+            stop_points=stop_points, target_points=target_points, trail_points=trail_points,
+            sl_stop=native_stops.get("sl_stop"), tp_stop=native_stops.get("tp_stop"),
+            sl_trail=native_stops.get("sl_trail"),
+            volume=volume, rates=rates, fx=fx, base_currency=account_currency,
+            fx_markup=fx_markup, fx_markup_currency=converted_to, point_fx=point_fx,
+            init_cash=init_cash,
+            allow_partial=bool(sim_kwargs.get("allow_partial", True)),
+            risk_basis=risk_basis,
+            order_bars=order_bars,
+            spec_kwargs=spec_kwargs,
+            passthrough=passthrough,
+        )
 
-        split = stops_active(ctx["stops"], sim_kwargs)
-        if split and not can_split(sim_kwargs):
-            split = False
-            warnings.warn(
-                "A custom signal_func_nb, or templates in a stop-adjustment callback's "
-                "arguments, were given, so bars cannot be split into the open and the rest "
-                "of the bar, and stops are NOT checked on the bar a position is entered: a "
-                "stop the entry bar trades through is missed. That flatters the result, "
-                "most for tight stops on daily bars. Pass the arrays a callback needs as "
-                "plain per-bar arrays instead of templates to avoid it.",
-                stacklevel=2,
+    def simulated(ctx):
+        """Simulate one resolved context and charge its holding costs."""
+        from ..core.portfolio import Portfolio
+
+        kw = dict(sim_kwargs)
+        universe = ctx["universe"]
+        price = ctx["price"]
+        fill = ctx["fill_price"]
+        order_kwargs = ctx["order_kwargs"]
+
+        margin_loan = None
+        engine_cash = None
+        if init_cash is not None:
+            # Fund the leverage rather than only capping it. `buy_nb` bounds every long by
+            # cash, so a levered position is unreachable unless the engine is handed the
+            # buying power; `Portfolio.get_init_cash` subtracts the loan back out so
+            # reported equity, returns and every metric stay on the account's real size.
+            from ..margin.buying_power import buying_power
+
+            # `from_weights` turns cash sharing on itself (Section J: it is load-bearing
+            # for `call_seq="auto"`), so the basis has to be decided here rather than read
+            # off whatever the caller happened to pass.
+            shares_cash = bool(kw.get("cash_sharing", strategy == "weights"))
+            engine_cash, margin_loan = buying_power(
+                universe, init_cash, ctx["columns"], cash_sharing=shares_cash,
             )
-        if cash == "shared" and "call_seq" not in sim_kwargs:
-            sim_kwargs["call_seq"] = shared_call_seq(
-                close.index, ctx["columns"], **signals,
-                entry_priority=_next_bar_scores(entry_priority, close),
-                seed=sim_kwargs.get("seed"),
-                direction=sim_kwargs.get("direction"),
-                split_bars=split,
-            )
-        if split:
-            pf = simulate_split_bars(
-                Portfolio, close, fill, high, low, price=fill, signals=signals,
-                call_seq=sim_kwargs.pop("call_seq", None),
-                size=ctx["size"],
-                **order_kwargs,
-                **ctx["stops"],
-                **sim_kwargs,
+            kw["init_cash"] = engine_cash
+
+        if strategy == "weights":
+            if weights is None:
+                raise BacktestError("`schedule` was given without `weights`; there is nothing to target.")
+            # ⚠️ The rebalancing path is funded at EQUITY, never at buying power.
+            #
+            # `TargetPercent` is a fraction of the account value the ENGINE sees. Hand the
+            # engine `equity x leverage` and a 60/40 book on a 2x margin account silently
+            # becomes 120/80 — fully invested by the user's reckoning, 2x levered in fact.
+            # Rescaling the weights by 1/leverage does not fix it either: the loan is a
+            # constant while equity moves, so the ratio drifts and the book slowly
+            # under-invests.
+            #
+            # So weights mean "fraction of your equity", exactly, at every point in the
+            # run, and a book whose longs need more cash than that equity cannot fill.
+            # Rather than let vectorbt starve the last columns, `_fit_weights_to_cash`
+            # scales those rows pro rata (with a warning). Leverage belongs to the signal
+            # path, where it is funded.
+            if init_cash is not None:
+                kw["init_cash"] = float(np.sum(np.asarray(init_cash, dtype=float)))
+                margin_loan = None
+            fitted = _fit_weights_to_cash(weights, order_kwargs.get("lock_cash"))
+            pf = Portfolio.from_weights(
+                price,
+                fitted,
+                schedule=_next_bar(schedule, price) if schedule is not None else None,
+                price=fill,
+                universe=universe,
+                min_trade=min_trade,
+                leverage_budget=leverage_budget,
+                order_kwargs=order_kwargs,
+                **kw,
+            ).replace(margin_loan=margin_loan)
+        elif strategy == "signals":
+            # Point stops were converted to fractions of the fill price (the open), so they
+            # must be anchored there. vectorbt's default anchor is the entry bar's CLOSE: a
+            # buy filled at 100 on a bar closing at 103 had its 2-point stop at 100.94,
+            # above the entry. "price" is the order price before slippage — exactly what
+            # the points were converted against ("fillprice" would anchor after the spread).
+            kw.setdefault("stop_entry_price", "price")
+            # vectorbt's default "stoplimit" applies NO slippage to a stop fill, and the
+            # spread lives in `slippage`, so every stop and target exit paid no spread.
+            # "stopmarket" charges spread plus slippage like any other fill. A take-profit
+            # is a limit order and arguably should pay the spread but not slippage; one
+            # `slippage` field cannot separate the two, so it pays both — the conservative
+            # side of the error.
+            kw.setdefault("stop_exit_price", "stopmarket")
+
+            # ⚠️ With a stop active, every bar is simulated as its open plus the rest of
+            # the bar, so a stop is checked on the bar it was entered on. Whole bars leave
+            # the entry bar's range unchecked — always in the strategy's favour, and worst
+            # for tight stops on daily bars. See `split_bars`.
+            from .split_bars import can_split, simulate_split_bars, stops_active
+
+            split = stops_active(ctx["stops"], kw)
+            if split and not can_split(kw):
+                split = False
+                warnings.warn(
+                    "A custom signal_func_nb, or templates in a stop-adjustment callback's "
+                    "arguments, were given, so bars cannot be split into the open and the "
+                    "rest of the bar, and stops are NOT checked on the bar a position is "
+                    "entered: a stop the entry bar trades through is missed. That flatters "
+                    "the result, most for tight stops on daily bars. Pass the arrays a "
+                    "callback needs as plain per-bar arrays instead of templates to avoid it.",
+                    stacklevel=3,
+                )
+            if ctx["trail_distance"] is not None:
+                # A trailing stop in points keeps its distance behind the best price
+                # rather than becoming a fraction of the fill (issue 27). It is a stop
+                # adjustment callback of its own, so it cannot share the slot with one.
+                from .split_bars import _custom
+                from .trail import trail_points_nb
+
+                if _custom(kw.get("adjust_sl_func_nb")):
+                    raise BacktestError(
+                        "`trail_points` keeps a trailing stop a fixed distance behind the best "
+                        "price with a stop-adjustment callback of its own, so it cannot be "
+                        "combined with `adjust_sl_func_nb`. Trail inside your callback, or use "
+                        "a trailing stop in % of the price (`sl_stop=` with `sl_trail=True`)."
+                    )
+                kw["adjust_sl_func_nb"] = trail_points_nb
+                kw["adjust_sl_args"] = (
+                    np.ascontiguousarray(ctx["trail_distance"].to_numpy(dtype=np.float64)),
+                    2 if split else 1,
+                )
+            if cash == "shared" and "call_seq" not in kw:
+                kw["call_seq"] = shared_call_seq(
+                    price.index, ctx["columns"], **signals,
+                    entry_priority=_next_bar_scores(entry_priority, price),
+                    seed=kw.get("seed"),
+                    direction=kw.get("direction"),
+                    split_bars=split,
+                )
+            if split:
+                pf = simulate_split_bars(
+                    Portfolio, price, fill, high, low, price=fill, signals=signals,
+                    call_seq=kw.pop("call_seq", None),
+                    size=ctx["size"],
+                    **order_kwargs,
+                    **ctx["stops"],
+                    **kw,
+                )
+            else:
+                pf = Portfolio.from_signals(
+                    price,
+                    **signals,
+                    size=ctx["size"],
+                    open=fill,
+                    high=high, low=low,       # so stops are checked intrabar
+                    price=fill,               # fill at the open, not the close
+                    **order_kwargs,
+                    **ctx["stops"],
+                    **kw,
+                )
+        elif ctx["size"] is not None:
+            pf = Portfolio.from_orders(
+                price, size=_entry_only(ctx["size"]), price=fill,
+                **order_kwargs, **kw
             )
         else:
-            pf = Portfolio.from_signals(
-                close,
-                **signals,
-                size=ctx["size"],
-                open=fill,
-                high=high, low=low,       # so stops are checked intrabar
-                price=fill,               # fill at the open, not the close
-                **order_kwargs,
-                **ctx["stops"],
-                **sim_kwargs,
+            # ⚠️ An unsized hold is funded at EQUITY, like the weights branch. It buys with
+            # all the cash it has, so handing it buying power held `leverage` times the
+            # account: a "buy and hold" on a 30x spread bet carried 30x its equity and lost
+            # 247% while the market fell 6.5%.
+            if engine_cash is not None:
+                kw["init_cash"] = np.asarray(engine_cash, dtype=float) - np.asarray(
+                    margin_loan, dtype=float
+                )
+                margin_loan = None
+            pf = Portfolio.from_holding(price, price=fill, **order_kwargs, **kw)
+            if init_cash is not None:
+                _warn_if_hold_did_not_trade(pf, ctx["columns"])
+
+        # Carry the universe so `pf.x.user_size()` can report in £/pt, lots or shares
+        # rather than engine units — the whole reason a spread bettor uses this layer — and
+        # the loan so reported equity stays the account's, not the buying power's.
+        pf = pf.replace(universe=universe, margin_loan=margin_loan, high=high, low=low)
+
+        # Holding costs are applied AFTER the simulation, from the realised positions,
+        # rather than by replaying orders through `from_order_func`. That keeps every
+        # strategy type supported — the replay path has no notion of entries and exits —
+        # and keeps the level-3 dependency out of the default path entirely. See
+        # `apply_holding_costs` for the trade-off, and use `Portfolio.from_holding_costs`
+        # when the in-run feedback matters.
+        if _wants_holding_costs(universe, rates):
+            from ..holding.callback import apply_holding_costs
+
+            pf = apply_holding_costs(
+                pf, universe, rates=rates, markup=financing_markup,
+                carry_markup=carry_markup, holidays=holidays,
             )
-    elif ctx["size"] is not None:
-        pf = Portfolio.from_orders(
-            close, size=_entry_only(ctx["size"]), price=fill,
-            **order_kwargs, **sim_kwargs
-        )
-    else:
-        # ⚠️ An unsized hold is funded at EQUITY, like the weights branch. It buys with all
-        # the cash it has, so handing it buying power held `leverage` times the account:
-        # a "buy and hold" on a 30x spread bet carried 30x its equity and lost 247% while
-        # the market fell 6.5%.
-        if engine_cash is not None:
-            sim_kwargs["init_cash"] = np.asarray(engine_cash, dtype=float) - np.asarray(
-                margin_loan, dtype=float
-            )
-            margin_loan = None
-        pf = Portfolio.from_holding(close, price=fill, **order_kwargs, **sim_kwargs)
-        if init_cash is not None:
-            _warn_if_hold_did_not_trade(pf, ctx["columns"])
+        else:
+            # No holding cost is computed, so nothing else would notice a short share held
+            # with no borrow rate. It must not borrow for free in silence (G6).
+            from ..holding.borrow import warn_unpriced_shorts
 
-    # Carry the universe so `pf.x.user_size()` can report in £/pt, lots or shares rather
-    # than engine units — the whole reason a spread bettor uses this layer — and the loan
-    # so reported equity stays the account's, not the buying power's.
-    pf = pf.replace(universe=universe, margin_loan=margin_loan, high=high, low=low)
+            warn_unpriced_shorts(universe, pd.DataFrame(pf.assets()), list(pf.wrapper.columns),
+                                 stacklevel=5)
+        return pf
 
-    # Holding costs are applied AFTER the simulation, from the realised positions, rather
-    # than by replaying orders through `from_order_func`. That keeps every strategy type
-    # supported — the replay path has no notion of entries and exits — and keeps the
-    # level-3 dependency out of the default path entirely. See `apply_holding_costs` for
-    # the trade-off, and use `Portfolio.from_holding_costs` when the in-run feedback
-    # matters.
-    if _wants_holding_costs(universe, rates):
-        from ..holding.callback import apply_holding_costs
-
-        pf = apply_holding_costs(
-            pf, universe, rates=rates, markup=financing_markup,
-            carry_markup=carry_markup, holidays=holidays,
-        )
-    else:
-        # No holding cost is computed, so nothing else would notice a short share held
-        # with no borrow rate. It must not borrow for free in silence (G6).
-        from ..holding.borrow import warn_unpriced_shorts
-
-        warn_unpriced_shorts(universe, pd.DataFrame(pf.assets()), list(pf.wrapper.columns),
-                             stacklevel=4)
-    return pf
+    if risk_of == "init_cash" or strategy != "signals":
+        return simulated(prepared())
+    return _sized_from_the_account(prepared, simulated, risk_of, init_cash, order_bars)
 
 
 def _wants_holding_costs(universe, rates) -> bool:
@@ -472,6 +549,192 @@ def _wants_holding_costs(universe, rates) -> bool:
         if "borrow" in filled.active_costs and filled.borrow_rate:
             return True
     return False
+
+
+#: What `risk_pct` may be a fraction of.
+RISK_BASES = ("init_cash", "balance", "equity")
+
+
+def _check_risk_of(risk_of, risk_pct, risk_amount, init_cash) -> str:
+    """Validate `risk_of`; None means `"init_cash"`."""
+    if risk_of is None:
+        return "init_cash"
+    if risk_of not in RISK_BASES:
+        raise BacktestError(f"`risk_of` must be one of {list(RISK_BASES)}, got {risk_of!r}.")
+    if risk_of != "init_cash":
+        if risk_pct is None:
+            raise BacktestError(
+                "`risk_of` says what `risk_pct` is a fraction of, so it needs `risk_pct=`. "
+                "`risk_amount` is a fixed sum on every trade and has no basis."
+            )
+        if init_cash is None:
+            raise BacktestError("`risk_of` needs `init_cash=`, the account the run starts from.")
+    return risk_of
+
+
+def _opening_bars(signals, close, direction) -> pd.DataFrame:
+    """The bars an order may open or add to a position: the shifted entries.
+
+    Exits close what is held and are not sized, so they are not counted, except where
+    `direction="both"` makes `exits` the short entries. An unknown or per-column
+    `direction` counts them too: measuring a bar too many is the safe side for a warning.
+    """
+    from .cash import _direction_mode
+
+    def as_mask(signal):
+        if signal is None:
+            return np.zeros(close.shape, dtype=bool)
+        if isinstance(signal, pd.Series) or np.ndim(signal) == 1:
+            row = np.asarray(signal, dtype=bool).ravel()
+            return np.repeat(row[:, None], close.shape[1], axis=1)
+        return pd.DataFrame(signal).reindex(index=close.index, columns=close.columns) \
+            .fillna(False).to_numpy(dtype=bool)
+
+    opening = as_mask(signals["entries"]) | as_mask(signals["short_entries"])
+    if signals["short_entries"] is None and signals["short_exits"] is None:
+        try:
+            both = _direction_mode(direction) == "both"
+        except BacktestError:
+            both = True
+        if both:
+            opening |= as_mask(signals["exits"])
+    return pd.DataFrame(opening, index=close.index, columns=close.columns)
+
+
+def _sized_from_the_account(prepared, simulated, risk_of, init_cash, order_bars):
+    """Size every entry from the balance or equity at its signal bar (`risk_of`).
+
+    The account at an entry depends on every fill, cost and stop before it, so the sizes
+    cannot be worked out before the simulation, and vectorbt's signal callback cannot see
+    cash. So the backtest is run, each entry is re-sized from that run's account at its
+    signal bar, and it is run again, until no entry's size changes.
+
+    It ends, and exactly: a size depends only on the account at the bar before it, so a
+    run whose first k entries are sized right sizes entry k + 1 right on the next, and
+    never undoes the first k. There are at most as many runs as entry bars, plus one; in
+    practice two to four, because a change in one trade's size moves the next by only
+    about `risk_pct` of the change in its P&L.
+
+    Warnings are recorded on each run and those of the final one re-issued, so each is
+    said once, about the backtest returned.
+    """
+    placed = order_bars.to_numpy(dtype=bool)
+    limit = int(placed.any(axis=1).sum()) + 2
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ctx = prepared()
+        pf = simulated(ctx)
+    said = list(caught)
+
+    for _ in range(limit):
+        basis = account_basis(pf, risk_of)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            following = prepared(basis)
+            if _same_sizes(following["size"], ctx["size"], placed):
+                break
+            pf = simulated(following)
+        ctx, said = following, list(caught)
+    else:  # pragma: no cover - impossible by the argument above
+        raise RuntimeError(
+            f"Sizing from the {risk_of} did not settle after {limit} runs. Please report "
+            f"this: each size depends only on earlier bars, so it should."
+        )
+
+    for item in said:
+        warnings.warn_explicit(item.message, item.category, item.filename, item.lineno)
+    return pf
+
+
+def _same_sizes(new, old, placed) -> bool:
+    """Whether two size frames agree on every bar an order may be placed on."""
+    a = pd.DataFrame(new).to_numpy(dtype=float)[placed]
+    b = pd.DataFrame(old).to_numpy(dtype=float)[placed]
+    return bool(np.all(np.isclose(a, b, rtol=1e-12, atol=0.0, equal_nan=True)))
+
+
+def account_basis(pf, risk_of) -> pd.DataFrame:
+    """The balance or equity each column's orders are sized from, per fill bar.
+
+    Args:
+        pf: a front-door `Portfolio`, holding costs charged.
+        risk_of: `"balance"` or `"equity"`.
+
+    Returns:
+        DataFrame on the portfolio's index and columns. Row `t` is the account at bar
+        `t - 1`'s close, the last value known when an order filling at bar `t`'s open was
+        sent; row 0 is the starting equity.
+
+    Notes:
+        **Equity** is the account's value at the close: cash plus open positions marked
+        at the close, holding costs included (`pf.value()`, which nets out a margin loan).
+        **Balance** is the equity less the open positions' profit or loss, which is the
+        cash plus what the open positions cost: starting cash, plus closed trades' P&L,
+        less every cost and holding cost charged so far. A commission is out of the
+        balance when it is paid; a spread sits in the fill price, so it is in the open
+        P&L until the position closes.
+
+        Separate accounts read their own column; a shared account (`cash_sharing` with a
+        group) reads the account, so every column in it sizes from the same figure.
+    """
+    columns = list(pf.wrapper.columns)
+    index = pf.wrapper.index
+    assets = pd.DataFrame(pf.assets(), index=index, columns=columns)
+    close = pd.DataFrame(pf.close, index=index, columns=columns)
+    open_pnl = assets * close - _cost_basis(pf, index, columns)
+
+    if pf.cash_sharing:
+        groups = np.asarray(pf.wrapper.grouper.get_groups())
+        value = pd.DataFrame(pf.value())
+        start = np.atleast_1d(np.asarray(pf.get_init_cash(), dtype=float))
+        out = {}
+        for k, col in enumerate(columns):
+            members = [columns[j] for j in range(len(columns)) if groups[j] == groups[k]]
+            account = value.iloc[:, groups[k]].to_numpy(dtype=float)
+            if risk_of == "balance":
+                account = account - open_pnl[members].sum(axis=1).to_numpy(dtype=float)
+            out[col] = np.concatenate([[start[groups[k]]], account[:-1]])
+        return pd.DataFrame(out, index=index)
+
+    value = pd.DataFrame(pf.value(group_by=False), index=index, columns=columns)
+    if risk_of == "balance":
+        value = value - open_pnl
+    start = np.broadcast_to(np.asarray(pf.get_init_cash(group_by=False), dtype=float),
+                            (len(columns),))
+    shifted = value.shift(1)
+    shifted.iloc[0] = start
+    return shifted
+
+
+def _cost_basis(pf, index, columns) -> pd.DataFrame:
+    """What each column's open position cost, at each bar's close: size x average entry.
+
+    Zero when flat. Fees are not in it (they left the cash when paid), so cash plus the
+    cost basis is the balance.
+    """
+    records = pf.orders.values
+    signed = np.where(records["side"] == 0, records["size"], -records["size"])
+    order = np.lexsort((np.arange(len(records)), records["idx"], records["col"]))
+    out = np.full((len(index), len(columns)), np.nan)
+    position = np.zeros(len(columns))
+    basis = np.zeros(len(columns))
+    for r in order:
+        col, i, q, p = int(records["col"][r]), int(records["idx"][r]), signed[r], records["price"][r]
+        before = position[col]
+        after = before + q
+        if abs(after) < 1e-12:
+            after, cost = 0.0, 0.0
+        elif before == 0 or np.sign(q) == np.sign(before):
+            cost = basis[col] + q * p                  # adding: the new units at their price
+        elif np.sign(after) == np.sign(before):
+            cost = basis[col] * after / before         # reducing: the average stays
+        else:
+            cost = after * p                           # reversed: the new side at this price
+        position[col], basis[col] = after, cost
+        out[i, col] = cost
+    frame = pd.DataFrame(out, index=index, columns=columns).ffill().fillna(0.0)
+    return frame
 
 
 def _resolve_currencies(account_currency, base_currency, spec_kwargs, instruments):

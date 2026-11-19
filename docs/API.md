@@ -87,13 +87,20 @@ misunderstanding of the product, not a typo.
 | `spread_points` | yes | **primary cost** | yes | **primary cost** |
 | `allow_fractional` | **yes** | rejected | rejected | rejected |
 | `base_currency` | rejected | **fx only** (for carry) | **fx only** | **required** |
-| `leverage` default | 2× | 5/10/30× by class | 5/10/30× by class | 2× |
+| `leverage` default | 1× (a margin account is `leverage=2`) | 5/10/30× by class | 5/10/30× by class | 1× |
 | overnight cost | financing | carry if fx, else financing | same | **carry** |
 | `price_field` default | `adj_close` | `close` | `close` | `close` |
 
 For `asset_class="fx"`, `point_size` is **derived from the quote currency** — `0.01` for
 JPY-quoted pairs, `0.0001` otherwise — so a mixed book needs no per-pair override.
-Contradicting the convention warns.
+Contradicting the convention warns. The point is derived wherever else the market fixes
+it: `asset_class="index"` is quoted in index points (`1.0`), and a price written in pence
+(quote currency `GBp` or `GBX`, Yahoo's `.L` quotes) moves one point per penny (`1.0`).
+Commodities keep the mode's `0.01`; their point is broker-specific, so name it.
+
+Bought outright (`equity`) and FX spot **borrow nothing by default** (1×): owning shares or
+holding the currency needs no loan. Pass `leverage=2` for a margin account; `validate_spec`
+warns only above 2×. Spread bets and CFDs default to the retail limits.
 
 **Strategy type is implied by the arguments.**
 
@@ -118,18 +125,51 @@ cash (the constraint is the net long weight); with it, the gross weight.
 **Sizing — exactly one.** Two given raises, naming both.
 
 ```python
-risk_pct=0.01          # fraction of init_cash risked per trade; requires stop_points
+risk_pct=0.01          # fraction of the account risked per trade (see risk_of)
 risk_amount=100        # absolute money at risk per trade
 stake=2.50             # the instrument's own units: £/pt, lots, or shares
 notional=25_000        # target exposure per position
 size=<array>           # raw engine-unit passthrough, the escape hatch
 ```
 
-⚠️ `risk_pct` sizes off `init_cash`, **not compounding equity** — at level 1 equity is only
-known before the simulation runs. Material over a long backtest with real drawdowns.
+**Risk sizing** sizes each entry to lose the risk at its stop, `engine = risk / distance`,
+from whichever stop is given: `stop_points` (points × point size), `sl_stop` (the fraction
+× the fill price) or a trailing stop's first distance. An entry whose stop is missing on
+its bar (a per-bar stop still warming up) is not placed, with a warning. **With no stop at
+all**, a position is sized as if its margin were the risk: at leverage `L` it is worth
+`risk × L`, an implied stop `1 / L` of the price away (the price going to zero at 1×, 20% at
+5×). It sizes only: no stop is placed, a gap past the implied stop loses more than the
+risk, margin calls are not modelled, and a warning says so.
+
+**`risk_of`** says what `risk_pct` is a fraction of:
+
+| `risk_of` | Basis |
+|---|---|
+| `"init_cash"` (default) | the starting cash: the same amount on every trade |
+| `"balance"` | cash after closed trades, costs and holding costs so far |
+| `"equity"` | the balance plus open positions marked at the close |
+
+The balance or equity is read at the close of the signal bar, the last value known when the
+order is sent. Separate accounts read their own column; a shared account reads the account.
+Both depend on every fill before the entry, so the backtest is simulated again, sized from
+the previous run's account, until no entry's size changes: each size depends only on
+earlier bars, so this ends, with exactly the result sizing inside the simulation would
+give (typically two to four runs). Warnings are those of the final run.
 
 **Stops in points**, converted internally to the native price fractions:
-`stop_points`, `target_points`, `trail_points`. Native `sl_stop` etc. are still accepted.
+`stop_points`, `target_points`, `trail_points`. Native `sl_stop` and `tp_stop` are still
+accepted; give each leg once, in points or natively, or it raises. Each takes a number,
+one value per column (a dict, or a list in column order), or a **DataFrame per bar**.
+
+⚠️ **A per-bar stop is aligned with the signals and shifted with them**, points and native
+fractions alike: a stop worked out at the signal bar's close (`3 * atr`) is the one set at
+the fill. vectorbt on its own reads a per-bar `sl_stop` at the fill bar, a bar late, which
+is lookahead. A scalar or per-column native value passes through unchanged.
+
+A **trailing stop in points** stays that many points behind the best price since entry
+(a front-door `adjust_sl_func_nb` keeps the distance in price); it cannot be combined with
+a callback of your own. A trailing stop in % (`sl_stop` with `sl_trail=True`) is a fraction
+of the best price, as in vectorbt.
 
 Stops are anchored at the **fill**, not the entry bar's close: the front door sets
 `stop_entry_price="price"` (the order price before slippage, which is what the points were
@@ -334,9 +374,9 @@ eurusd = vbt.x.Instrument(mode="fx_spot", point_size=0.0001, contract_size=100_0
 Default field values for a mode.
 
 ### `vbt.x.max_leverage(mode, asset_class=None)` → `float`
-Default maximum leverage. Equity 2×, FX spot 2×; spread bet / CFD 5× stocks, 10×
-commodities and indices, 30× FX. Tiered margin is deliberately not modelled — set a
-sensible maximum instead.
+Default leverage. Equity 1×, FX spot 1× (no borrowing unless asked); spread bet / CFD 5×
+stocks, 10× commodities and indices, 30× FX. Tiered margin is deliberately not modelled —
+set a sensible maximum instead.
 
 ### `vbt.x.default_cost_stack(mode, asset_class=None)` → `frozenset`
 
@@ -569,7 +609,15 @@ Returns a `ConvertedFrame` carrying:
 - `.native` — the original series, retained for decomposition
 - `.fx_markup` — read off `open` by the front door and added to `slippage` on every fill
   of a converted column (a converted Series carries it in `.attrs` instead)
+- `.fx_rate` — the rate each bar was converted at (a Series: `.attrs["fx_rate"]`). The
+  front door reads it off `open` so that **points stay in the instrument's own price**: a
+  point is a unit of the native price, so on a converted price it is `point_size × rate`.
+  Stops, targets and trails in points, risk sizing from them, and the spread all use it. A
+  50-point stop on a USD share in a GBP account is 50 cents, not 50 pence.
 - `.decompose()` — splits total return into asset return and FX return
+
+A price in pence (`GBp`, `GBX`) converts to pounds at 0.01, and to anything else through
+sterling.
 
 `fx_markup` models the broker's worse-than-market conversion rate. It is applied as
 slippage rather than baked into the price series, because a uniform rescaling of a single
@@ -732,9 +780,14 @@ Emits `TargetPercent`-ready targets: the weight on rebalance bars, **NaN everywh
 > constant non-NaN input across off-schedule bars **warns**.
 
 Quantization happens **before** emission; quantizing afterwards loses the drift
-information. The optional minimum-trade filter suppresses trades costing more than the
-drift they correct, and routes the suppressed drift into the drift report rather than
-letting it vanish as invisible tracking error.
+information.
+
+**`min_trade` is a weight gap.** On a rebalance bar, a column whose target is within
+`min_trade` of the weight its holding has drifted to gets no order (NaN), and the gap left
+goes into the drift report rather than vanishing as invisible tracking error. The first
+rebalance always trades in full. `to_targets` estimates the holding from the drift,
+ignoring costs and rounding; `Portfolio.from_weights` (and the front door) measures it on
+the simulation, so there it is exact.
 
 ---
 

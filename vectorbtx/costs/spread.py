@@ -31,6 +31,12 @@ class Spread(_Base):
         if points == 0:
             return {"slippage": 0.0}
         half_gap = 0.5 * points * spec.point_size
+        # ⚠️ On a price converted to the account currency, a point is `point_size x rate`
+        # (the spread is quoted in the instrument's own price), so the gap is scaled by the
+        # rate the price was converted at. Without it the fraction was off by the FX rate.
+        point_fx = ctx.get("point_fx")
+        if point_fx is not None:
+            half_gap = half_gap * np.asarray(point_fx, dtype=float)
         with np.errstate(divide="ignore", invalid="ignore"):
             frac = half_gap / np.asarray(price, dtype=float)
         return {"slippage": np.nan_to_num(frac, nan=0.0, posinf=0.0)}

@@ -85,21 +85,34 @@ def to_targets(weights, schedule=None, universe=None, price=None, equity=None, m
         weights: DataFrame of target weights.
         schedule: boolean Series, True on rebalance bars. None → every bar.
         universe: the `Universe`, for quantization.
-        price: price frame, needed to quantize weights into fillable sizes.
-        equity: account equity, needed for the same reason.
-        min_trade: suppress rebalance trades whose weight change is below this.
+        price: price frame, needed to quantize weights into fillable sizes, and by
+            `min_trade` to tell how far each holding has drifted.
+        equity: account equity, needed for quantization.
+        min_trade: skip a column's rebalance trade when its target is within this weight
+            of the holding just before the rebalance (see Notes).
 
     Returns:
-        `(targets, drift)` — targets with **NaN off-schedule**, and a drift frame
-        combining quantization and suppression.
+        `(targets, drift)` — targets with **NaN off-schedule** (and on a skipped trade),
+        and a drift frame combining quantization and suppression.
 
     Notes:
         Quantize **before** emitting targets. Quantizing after the engine has computed
         target percentages loses the drift information entirely.
 
-        The minimum-trade filter is available but off by default. Suppressed trades
-        accumulate as tracking error, so their drift is routed through Section D's
-        reporting rather than being allowed to vanish.
+        **`min_trade` is a weight gap.** On each rebalance bar, a column whose target is
+        within `min_trade` of the weight it has drifted to is given no order (NaN), so its
+        position keeps drifting; the gap left is recorded as suppressed drift. The first
+        rebalance always trades in full: it builds the book. A trade to a target of zero
+        is a trade like any other, so a holding within `min_trade` of nothing is left.
+
+        Here the holding is an **estimate**: the book drifted with the prices since each
+        trade, ignoring costs and rounding. `Portfolio.from_weights` (and so the front
+        door) makes it exact by measuring the simulated holding at each rebalance.
+
+        ⚠️ This compared each target with the previous TARGET until OpenStrategy Studio
+        issue 21, and wrote the old target back, so the engine still traded from the
+        drifted holding back to it. Fixed weights never change, so `min_trade` did nothing
+        at all; moving weights had only their small changes frozen.
     """
     w = pd.DataFrame(weights).astype(float)
 
@@ -117,8 +130,14 @@ def to_targets(weights, schedule=None, universe=None, price=None, equity=None, m
         targets, drift = _quantize_weights(targets, universe, price, equity)
 
     if min_trade:
-        targets, suppressed = _apply_min_trade(targets, mask, min_trade)
-        drift = drift.add(suppressed, fill_value=0.0)
+        if price is None:
+            raise ValueError(
+                "`min_trade` compares each target with the weight its holding has drifted "
+                "to, which needs `price=`."
+            )
+        skip, gap = estimated_min_trade_skips(targets, mask, price, min_trade)
+        targets = targets.where(~skip)
+        drift = drift.add(gap.where(skip, 0.0), fill_value=0.0)
 
     # NaN off-schedule. These two lines are the whole section.
     mask2d = pd.DataFrame(
@@ -192,24 +211,113 @@ def _quantize_weights(weights, universe, price, equity):
     return out, drift
 
 
-def _apply_min_trade(targets, mask, min_trade):
-    """Suppress rebalance trades below `min_trade`, recording what was skipped."""
-    out = targets.copy()
-    suppressed = pd.DataFrame(0.0, index=targets.index, columns=targets.columns)
-    last = None
-    for i, (ts, row) in enumerate(targets.iterrows()):
-        if not mask.iloc[i]:
+def _schedule_mask(schedule, index) -> pd.Series:
+    """The rebalance bars as a boolean Series on `index`; None is every bar."""
+    if schedule is None:
+        return pd.Series(True, index=index)
+    return pd.Series(schedule).reindex(index).fillna(False).astype(bool)
+
+
+def estimated_min_trade_skips(targets, mask, price, min_trade):
+    """Which rebalance trades `min_trade` skips, with the holding estimated from drift.
+
+    The book is followed bar by bar as a fraction of one unit of equity: each column's
+    holding moves with its price, cash stays put, and on each rebalance bar a column within
+    `min_trade` of its target is left while the others trade to theirs. Costs, rounding and
+    partial fills are ignored, so this can disagree with the simulated holding by a little;
+    `measured_min_trade_skips` measures the real one.
+
+    Args:
+        targets: target weights, NaN where no order is wanted.
+        mask: boolean Series of rebalance bars.
+        price: the price trades fill and the book is valued at, on each bar.
+        min_trade: the weight gap below which a trade is skipped.
+
+    Returns:
+        `(skip, gap)`: boolean frame of skipped trades, and each rebalance cell's target
+        minus the holding just before it (0 elsewhere).
+    """
+    t = pd.DataFrame(targets).astype(float)
+    px = pd.DataFrame(price).reindex(index=t.index, columns=t.columns).to_numpy(dtype=float)
+    on = pd.Series(mask).reindex(t.index).fillna(False).to_numpy(dtype=bool)
+    wanted = t.to_numpy(dtype=float)
+
+    skip = np.zeros(wanted.shape, dtype=bool)
+    gap = np.zeros(wanted.shape)
+    units = np.zeros(wanted.shape[1])
+    cash = 1.0
+    first = True
+    for i in range(len(t)):
+        if not on[i]:
             continue
-        if last is None:
-            last = row
+        p = px[i]
+        held = np.where(units != 0, units * p, 0.0)
+        value = cash + np.nansum(held)
+        current = held / value if value > 0 else np.zeros_like(held)
+        target = wanted[i]
+        live = np.isfinite(target) & np.isfinite(p) & (p > 0)
+        gap[i] = np.where(live, target - current, 0.0)
+        if not first:
+            skip[i] = live & (np.abs(target - current) < min_trade)
+        trade = live & ~skip[i]
+        new_units = np.where(trade, target * value / np.where(trade, p, 1.0), units)
+        cash -= np.nansum(np.where(trade, (new_units - units) * p, 0.0))
+        units = new_units
+        first = False
+    return (pd.DataFrame(skip, index=t.index, columns=t.columns),
+            pd.DataFrame(gap, index=t.index, columns=t.columns))
+
+
+def measured_min_trade_skips(pf, targets, mask, price, min_trade):
+    """Which rebalance trades `min_trade` skips, measured on a simulated portfolio.
+
+    On each rebalance bar, each column's holding is read as the engine sees it before
+    trading: the position after the previous bar, valued at this bar's price, as a share
+    of its group's value at that price (what `TargetPercent` is a fraction of).
+
+    Args:
+        pf: the portfolio simulated with the previous estimate's skips.
+        targets, mask, price, min_trade: as `estimated_min_trade_skips`.
+
+    Returns:
+        `(skip, gap)`, as `estimated_min_trade_skips`.
+    """
+    t = pd.DataFrame(targets).astype(float)
+    index, columns = t.index, list(t.columns)
+    px = pd.DataFrame(price).reindex(index=index, columns=columns).to_numpy(dtype=float)
+    on = pd.Series(mask).reindex(index).fillna(False).to_numpy(dtype=bool)
+    wanted = t.to_numpy(dtype=float)
+
+    assets = pd.DataFrame(pf.assets(), index=index, columns=columns).to_numpy(dtype=float)
+    groups = np.asarray(pf.wrapper.grouper.get_groups())
+    cash = np.asarray(pd.DataFrame(pf.cash()).to_numpy(dtype=float))
+    start = np.atleast_1d(np.asarray(pf.get_init_cash(), dtype=float))
+    if not pf.cash_sharing:
+        groups = np.arange(len(columns))
+        cash = pd.DataFrame(pf.cash(group_by=False)).to_numpy(dtype=float)
+        start = np.broadcast_to(np.asarray(pf.get_init_cash(group_by=False), dtype=float),
+                                (len(columns),))
+
+    skip = np.zeros(wanted.shape, dtype=bool)
+    gap = np.zeros(wanted.shape)
+    first = True
+    for i in range(len(index)):
+        if not on[i]:
             continue
-        change = (row - last).abs()
-        small = change < min_trade
-        if small.any():
-            out.loc[ts, small] = last[small]
-            suppressed.loc[ts, small] = (row - last)[small]
-        last = out.loc[ts]
-    return out, suppressed
+        before = assets[i - 1] if i > 0 else np.zeros(len(columns))
+        held = np.where(before != 0, before * px[i], 0.0)
+        cash_before = cash[i - 1] if i > 0 else start
+        value = np.array([cash_before[groups[k]] + np.nansum(held[groups == groups[k]])
+                          for k in range(len(columns))])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            current = np.where(value > 0, held / value, 0.0)
+        live = np.isfinite(wanted[i]) & np.isfinite(px[i])
+        gap[i] = np.where(live, wanted[i] - current, 0.0)
+        if not first:
+            skip[i] = live & (np.abs(wanted[i] - current) < min_trade)
+        first = False
+    return (pd.DataFrame(skip, index=index, columns=columns),
+            pd.DataFrame(gap, index=index, columns=columns))
 
 
 def validate_weights(weights, tolerance: float = 1e-6) -> None:

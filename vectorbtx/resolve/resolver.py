@@ -50,6 +50,7 @@ def resolve_universe(
     notional=None,
     size=None,
     fx_markup=None,
+    point_fx=None,
     include_costs: bool = True,
     include_quantization: bool = True,
     include_leverage: bool = True,
@@ -71,6 +72,8 @@ def resolve_universe(
         size: order size, required by `commission_per_unit`.
         fx_markup: FX conversion markup, a scalar or `dict[column, markup]`, added to
             `slippage`. None reads it off `data` when that is a `ConvertedFrame`.
+        point_fx: the rate each column was converted at, per bar (`fx_rate_of`), so a
+            cost in points is in the account currency. None reads it off `data`.
         include_costs: emit `fees` / `fixed_fees` / `slippage`.
         include_quantization: emit `size_granularity` / `min_size`.
         include_leverage: emit `max_size` (needs `equity`).
@@ -91,6 +94,10 @@ def resolve_universe(
         from ..fx.convert import fx_markup_of
 
         fx_markup = fx_markup_of(data)
+    if point_fx is None:
+        from ..fx.convert import fx_rate_of
+
+        point_fx = fx_rate_of(data, index=_price_frame(data, columns).index, columns=columns)
     price = _price_frame(data, columns)
 
     # ⚠️ An empty price frame is not a cost-resolution problem, but that is where it used
@@ -154,6 +161,7 @@ def resolve_universe(
                 notional=notional,
                 rates=rates,
                 fx_markup=fx_markup,
+                point_fx=point_fx,
             )
         )
 

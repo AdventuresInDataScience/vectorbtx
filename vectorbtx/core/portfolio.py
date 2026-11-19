@@ -395,8 +395,22 @@ class Portfolio(_Portfolio):
         Notes:
             Uses `SizeType.TargetPercent` with `cash_sharing=True`, `group_by=True` and
             `call_seq="auto"` — see Section J for why none of those three is optional.
+
+            **`min_trade` is exact here.** A column's rebalance trade is skipped when its
+            target is within `min_trade` of the weight the simulated holding has drifted
+            to (see `to_targets`). The holding depends on every earlier fill, cost and
+            rounding, so the skips are first estimated from the drift, then measured on
+            the simulation and simulated again until they no longer change. A skip
+            depends only on earlier bars, so this ends; usually the estimate is already
+            right, or one more run settles it.
         """
-        from ..construct.rebalance import apply_leverage_budget, to_targets
+        from ..construct.rebalance import (
+            _schedule_mask,
+            apply_leverage_budget,
+            estimated_min_trade_skips,
+            measured_min_trade_skips,
+            to_targets,
+        )
 
         weights = pd.DataFrame(weights)
         if leverage_budget and universe is not None:
@@ -413,7 +427,6 @@ class Portfolio(_Portfolio):
             universe=universe,
             price=close,
             equity=equity,
-            min_trade=min_trade,
         )
 
         # Prefer an already-resolved set. The front door resolves once, with the order
@@ -441,12 +454,29 @@ class Portfolio(_Portfolio):
         order_kwargs.setdefault("group_by", True)
         order_kwargs.setdefault("call_seq", "auto")
 
-        pf = cls.from_orders(
-            close,
-            size=targets,
-            size_type="targetpercent",
-            **order_kwargs,
-        )
+        def simulate(sizes):
+            return cls.from_orders(close, size=sizes, size_type="targetpercent", **order_kwargs)
+
+        if not min_trade:
+            return simulate(targets).replace(universe=universe, drift=drift)
+
+        # The price trades fill at, which is also what each holding is valued at when
+        # `TargetPercent` turns a weight into an order (vectorbt's default valuation).
+        valuation = order_kwargs.get("price")
+        if valuation is None or np.ndim(valuation) == 0:
+            valuation = close
+        mask = _schedule_mask(schedule, pd.DataFrame(close).index)
+        skip, gap = estimated_min_trade_skips(targets, mask, valuation, min_trade)
+        limit = int(mask.sum()) + 2
+        for _ in range(limit):
+            pf = simulate(targets.where(~skip))
+            measured, gap = measured_min_trade_skips(pf, targets, mask, valuation, min_trade)
+            if measured.equals(skip):
+                break
+            skip = measured
+        else:  # pragma: no cover - each skip depends only on earlier bars
+            raise RuntimeError(f"min_trade's skips did not settle after {limit} runs; please report this.")
+        drift = drift.add(gap.where(skip, 0.0), fill_value=0.0)
         return pf.replace(universe=universe, drift=drift)
 
     @classmethod
