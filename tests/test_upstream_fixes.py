@@ -1453,3 +1453,187 @@ def test_the_conversion_rate_survives_slicing_and_aligns_to_the_backtest():
     rate = fx_rate_of(sliced, index=sliced.index, columns=sliced.columns)
     assert rate.index.equals(sliced.index)
     assert np.allclose(rate["X"], fx.iloc[2:]) and np.allclose(rate["Y"], 1.0)
+
+
+# ############# 23, optional: notional_pct, a position worth a share of the account ############# #
+
+
+FRACTIONAL = dict(EQUITY, allow_fractional=True)
+
+
+def _bought(pf):
+    buys = pf.orders.records_readable.query("Side == 'Buy'")
+    return [(str(col), round(float(size), 6)) for col, size in zip(buys["Column"], buys["Size"])]
+
+
+def test_notional_pct_is_a_share_of_the_starting_cash():
+    o, h, l, c = frames([100.0] * 6, columns=("X", "Y"))
+    entries = mask(c.index, ["X", "Y"], [("X", 1), ("Y", 1)])
+    pf = run(o, h, l, c, entries=entries, exits=mask(c.index, ["X", "Y"]), notional_pct={"X": 0.5, "Y": 0.25},
+             init_cash=10_000, instruments={"X": FRACTIONAL, "Y": FRACTIONAL})
+    assert _bought(pf) == [("X", 50.0), ("Y", 25.0)]
+
+
+def test_notional_pct_from_the_equity_after_a_loss():
+    """Half the account each time: 50 shares, a 500 loss at the stop, then half of 9,500."""
+    lows = [99.5] * 10
+    lows[3] = 89.0
+    o, h, l, c = frames([100.0] * 10, lows=lows)
+    entries = mask(c.index, ["X"], [("X", 1), ("X", 5)])
+    for basis, second in (("init_cash", 50.0), ("balance", 47.5), ("equity", 47.5)):
+        pf = run(o, h, l, c, entries=entries, exits=mask(c.index, ["X"]), notional_pct=0.5, stop_points=10,
+                 init_cash=10_000, risk_of=basis, instruments={"X": FRACTIONAL})
+        assert _bought(pf) == [("X", 50.0), ("X", second)], basis
+
+
+def test_notional_pct_above_one_is_levered_and_funded_up_to_the_leverage():
+    o, h, l, c = frames([100.0] * 6)
+    entries = mask(c.index, ["X"], [("X", 1)])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        pf = run(o, h, l, c, entries=entries, exits=mask(c.index, ["X"]), notional_pct=1.5, init_cash=10_000,
+                 instruments={"X": dict(FRACTIONAL, leverage=2.0)})
+    assert _bought(pf) == [("X", 150.0)]
+    with pytest.warns(UserWarning, match="buying power"):
+        pf = run(o, h, l, c, entries=entries, exits=mask(c.index, ["X"]), notional_pct=1.5, init_cash=10_000,
+                 instruments={"X": FRACTIONAL})
+    assert _bought(pf) == [("X", 100.0)]
+
+
+def test_notional_pct_takes_one_value_or_one_per_column():
+    o, h, l, c = frames([100.0] * 6)
+    kwargs = dict(entries=mask(c.index, ["X"], [("X", 1)]), exits=mask(c.index, ["X"]), init_cash=10_000,
+                  instruments={"X": FRACTIONAL})
+    with pytest.raises(Exception, match="not a value per bar"):
+        run(o, h, l, c, notional_pct=pd.DataFrame({"X": 0.5}, index=c.index), **kwargs)
+    with pytest.raises(Exception, match="exactly one sizing argument"):
+        run(o, h, l, c, notional_pct=0.5, notional=1_000, **kwargs)
+    with pytest.raises(Exception, match="risk_pct` or `notional_pct"):
+        run(o, h, l, c, stake=1, risk_of="equity", **kwargs)
+
+
+# ############# 26, item 4: stops and targets at a price level ############# #
+
+
+def _level_case(opens=None, lows=None, highs=None, closes=None, short=False, **kwargs):
+    """Signal at bar 1, filled at bar 2's open. Returns (orders, warnings said)."""
+    opens = opens or [100.0] * 8
+    o, h, l, c = frames(opens, highs, lows, closes)
+    signal, none = mask(c.index, ["X"], [("X", 1)]), mask(c.index, ["X"])
+    sides = dict(entries=none, exits=none, short_entries=signal, short_exits=none) if short else \
+        dict(entries=signal, exits=none)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        pf = run(o, h, l, c, instruments={"X": FRACTIONAL}, init_cash=10_000, **sides, **kwargs)
+    said = [str(w.message) for w in caught if "borrowed the securities" not in str(w.message)]
+    return _orders(pf), said, pf
+
+
+def _levels(values):
+    return pd.DataFrame({"X": [float(v) for v in values]}, index=pd.bdate_range("2024-01-01", periods=len(values)))
+
+
+DIPS = [99.5, 99.5, 99.5, 97.0, 96.0, 99.5, 99.5, 99.5]
+
+
+def test_a_stop_level_is_read_at_the_signal_bar_and_sits_on_it():
+    """97.3 at the signal bar, 99 at the fill bar: the stop is at 97.3."""
+    got, _, _ = _level_case(lows=DIPS, size=1, stop_price=_levels([90, 97.3, 99, 90, 90, 90, 90, 90]))
+    assert got == [(2, "Buy", 100.0), (3, "Sell", 97.3)]
+
+
+def test_a_level_holds_across_the_gap_a_distance_would_miss():
+    """The signal bar closes at 101 with its EMA at 97.3; the next bar opens at 100. A
+    distance taken at that close (3.7) puts the stop at 96.3, off the EMA by the gap; the
+    level puts it on the EMA."""
+    closes = [100.0, 101.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0]
+    highs = [101.5] * 8
+    level, _, _ = _level_case(lows=DIPS, highs=highs, closes=closes, size=1,
+                              stop_price=_levels([90, 97.3, 90, 90, 90, 90, 90, 90]))
+    distance, _, _ = _level_case(lows=DIPS, highs=highs, closes=closes, size=1,
+                                 stop_points=_levels([9, 101.0 - 97.3, 9, 9, 9, 9, 9, 9]))
+    assert level == [(2, "Buy", 100.0), (3, "Sell", 97.3)]
+    assert distance == [(2, "Buy", 100.0), (4, "Sell", 96.3)]
+
+
+def test_a_target_level_is_checked_from_the_entry_bar():
+    got, _, _ = _level_case(size=1, target_price=_levels([200, 100.4, 300, 200, 200, 200, 200, 200]))
+    assert got == [(2, "Buy", 100.0), (2, "Sell", 100.4)]
+
+
+def test_a_short_stop_level_sits_above_the_fill():
+    highs = [100.5, 100.5, 100.5, 103.0, 100.5, 100.5, 100.5, 100.5]
+    got, _, _ = _level_case(highs=highs, short=True, size=1, stop_price=_levels([110, 102.5, 110, 110, 110, 110, 110, 110]))
+    assert got == [(2, "Sell", 100.0), (3, "Buy", 102.5)]
+
+
+@pytest.mark.parametrize("short, kwargs", [
+    (False, dict(stop_price=101.0)),            # a long's stop above its fill
+    (False, dict(target_price=99.0)),           # a long's target below it
+    (True, dict(stop_price=99.0)),              # a short's stop below its fill
+    (False, dict(stop_price=100.0)),            # at the fill: no distance at all
+])
+def test_a_level_on_the_wrong_side_of_the_fill_is_not_placed(short, kwargs):
+    got, said, _ = _level_case(short=short, size=1, **kwargs)
+    assert got == []
+    assert any("NOT PLACED" in text and "X: 1 of 1" in text for text in said)
+
+
+def test_risk_is_sized_from_a_stop_level():
+    """100 at risk, filled at 100 with the stop at 98: 50 shares."""
+    got, _, pf = _level_case(lows=DIPS, risk_amount=100, stop_price=98.0)
+    assert got == [(2, "Buy", 100.0), (3, "Sell", 98.0)]
+    assert _bought(pf) == [("X", 50.0)]
+
+
+def test_an_entry_with_no_level_has_no_stop_and_is_not_risk_sized():
+    levels = _levels([90, np.nan, 99, 90, 90, 90, 90, 90])
+    got, _, _ = _level_case(lows=DIPS, size=1, stop_price=levels)
+    assert got == [(2, "Buy", 100.0)]
+    got, said, _ = _level_case(lows=DIPS, risk_amount=100, stop_price=levels)
+    assert got == [] and any("no stop distance" in text for text in said)
+
+
+def test_a_trailing_level_ratchets_to_each_completed_bar_and_never_loosens():
+    """Level = the previous close - 3. Filled at 102 with the stop at 97 (the signal bar's
+    level), it rises with each completed bar to 105. Bar 6's level dips to 104.6, which
+    would loosen it, so the stop stays at 105, and bar 7 opens there."""
+    opens = [100.0, 100.0, 102.0, 104.0, 106.0, 108.0, 107.0, 105.0, 103.0, 101.0]
+    lows = [v - 0.5 for v in opens]
+    level = _levels([v - 3 for v in opens])
+    level.iloc[6] = 104.6
+    got, _, _ = _level_case(opens=opens, lows=lows, highs=[v + 0.5 for v in opens], size=1, trail_price=level)
+    assert got == [(2, "Buy", 102.0), (7, "Sell", 105.0)]
+
+
+def test_a_short_trailing_level_ratchets_down():
+    opens = [110.0, 110.0, 108.0, 106.0, 104.0, 102.0, 103.0, 105.0, 107.0, 109.0]
+    highs = [v + 0.5 for v in opens]
+    highs[6] = 105.4
+    level = _levels([v + 3 for v in opens])
+    got, _, _ = _level_case(opens=opens, highs=highs, lows=[v - 0.5 for v in opens], short=True, size=1,
+                            trail_price=level)
+    # Stop: 113 at entry, then 111, 109, 107, 105 (bar 5's level, used on bar 6); bar 6's
+    # high reaches 105.4, through it.
+    assert got == [(2, "Sell", 108.0), (6, "Buy", 105.0)]
+
+
+def test_a_trailing_level_past_the_market_exits_at_the_open():
+    """vectorbt cannot state a long stop above its best price; it fills at the open, as a
+    stop above the market does."""
+    opens = [100.0, 100.0, 102.0, 104.0, 106.0, 108.0, 107.0, 105.0, 103.0, 101.0]
+    level = _levels([v - 3 for v in opens])
+    level.iloc[6] = 110.0
+    got, _, _ = _level_case(opens=opens, lows=[v - 0.5 for v in opens], highs=[v + 0.5 for v in opens],
+                            size=1, trail_price=level)
+    assert got == [(2, "Buy", 102.0), (7, "Sell", 105.0)]
+
+
+def test_a_level_given_beside_the_same_leg_raises():
+    for kwargs in (dict(stop_price=98, stop_points=2), dict(stop_price=98, sl_stop=0.02),
+                   dict(trail_price=98, stop_price=97), dict(trail_price=98, trail_points=2),
+                   dict(target_price=103, target_points=3), dict(target_price=103, tp_stop=0.03)):
+        with pytest.raises(Exception, match="once"):
+            _level_case(size=1, **kwargs)
+    with pytest.raises(Exception, match="trail_price"):
+        _level_case(size=1, trail_price=97.0, adjust_sl_func_nb=_count_calls_sl_nb, adjust_sl_args=(np.zeros(9),))

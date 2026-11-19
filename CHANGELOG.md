@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+The two optional parts of OpenStrategy Studio issues 23 and 26.
+
+### Added
+
+- **`notional_pct=`: a position worth a share of the account** (issue 23's "the other
+  common rule"). `notional_pct=0.5` sizes each position to half the account; above 1 is a
+  levered position, funded up to the leverage. A number, or one per column (a dict, or a
+  list in column order). `risk_of` applies to it as to `risk_pct`: the starting cash by
+  default, or the balance or equity at the signal bar, with the same re-simulation. It is
+  a sixth sizing argument, so exactly one is still given.
+- **Stops and targets at a price level: `stop_price=`, `target_price=`, `trail_price=`**
+  (issue 26, item 4). A level is where the stop sits, not how far away: an EMA, a swing
+  low. It takes a number, one per column, or a DataFrame per bar, aligned with the signals
+  and shifted with them, so the level at the signal bar's close is the stop from the fill
+  on. A distance worked out at that close (`close - ema`) misses the gap to the next open
+  and puts the stop off the level by it; a level does not. At the fill it becomes
+  vectorbt's fraction of the fill price on the entry's side: below for a long's stop and a
+  short's target, above for the reverse. **A level on the wrong side of the fill** (a
+  long's stop at or above it, including after a gap) is an order a broker rejects: the
+  entry is not placed, and a warning counts them. Risk sizing reads a stop level like any
+  other stop (`risk / (fill - level)`). `trail_price` starts the stop at the signal bar's
+  level and moves it to each completed bar's level, never loosening it (a chandelier
+  exit), through a front-door `adjust_sl_func_nb`
+  (`vectorbtx.frontend.trail.trail_level_nb`) that runs on every split-bar step; it
+  cannot be combined with a callback of your own. Each leg is given once: a level beside
+  the same leg in points or as `sl_stop` / `tp_stop` raises.
+
+## 1de5744
+
 OpenStrategy Studio issues 21 to 29 (its `docs/UPSTREAM.md`).
 
 ### ⚠️ Changes results

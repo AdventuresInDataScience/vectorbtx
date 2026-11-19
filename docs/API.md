@@ -129,8 +129,12 @@ risk_pct=0.01          # fraction of the account risked per trade (see risk_of)
 risk_amount=100        # absolute money at risk per trade
 stake=2.50             # the instrument's own units: £/pt, lots, or shares
 notional=25_000        # target exposure per position
+notional_pct=0.5       # each position worth this share of the account (see risk_of)
 size=<array>           # raw engine-unit passthrough, the escape hatch
 ```
+
+`notional_pct` takes a number or one per column; above 1 is a levered position, funded up
+to the leverage.
 
 **Risk sizing** sizes each entry to lose the risk at its stop, `engine = risk / distance`,
 from whichever stop is given: `stop_points` (points × point size), `sl_stop` (the fraction
@@ -141,7 +145,7 @@ all**, a position is sized as if its margin were the risk: at leverage `L` it is
 5×). It sizes only: no stop is placed, a gap past the implied stop loses more than the
 risk, margin calls are not modelled, and a warning says so.
 
-**`risk_of`** says what `risk_pct` is a fraction of:
+**`risk_of`** says what `risk_pct` or `notional_pct` is a fraction of:
 
 | `risk_of` | Basis |
 |---|---|
@@ -165,6 +169,17 @@ one value per column (a dict, or a list in column order), or a **DataFrame per b
 fractions alike: a stop worked out at the signal bar's close (`3 * atr`) is the one set at
 the fill. vectorbt on its own reads a per-bar `sl_stop` at the fill bar, a bar late, which
 is lookahead. A scalar or per-column native value passes through unchanged.
+
+**Stops and targets at a price level**: `stop_price`, `target_price`, `trail_price`, for a
+stop at an EMA or a swing low. The same shapes as points, aligned with the signals and
+shifted with them: the level at the signal bar's close is where the stop sits from the fill
+on, whatever the gap to the next open (a distance taken at that close would land off the
+level by the gap). The level is placed on the entry's side of the fill; one on the wrong
+side (a long's stop at or above its fill, or its target at or below) is an order a broker
+rejects, so **the entry is not placed**, with a warning. Risk sizing reads a stop level as
+`risk / (fill - level)`. `trail_price` starts at the signal bar's level and moves the stop
+to each completed bar's level, never loosening it (a chandelier exit: `highest_high - 3 *
+atr`). A level never sits beside the same leg in points or natively.
 
 A **trailing stop in points** stays that many points behind the best price since entry
 (a front-door `adjust_sl_func_nb` keeps the distance in price); it cannot be combined with

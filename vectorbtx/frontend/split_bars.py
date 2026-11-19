@@ -154,9 +154,9 @@ def _custom(func):
 def step_aware(func) -> bool:
     """True for the front door's own callbacks, which see steps and index by bar themselves
     (`vectorbtx.frontend.trail`), so they run on every step, unwrapped."""
-    from .trail import trail_points_nb
+    from .trail import trail_level_nb, trail_points_nb
 
-    return func is not None and func is trail_points_nb
+    return func is not None and (func is trail_points_nb or func is trail_level_nb)
 
 
 def can_split(sim_kwargs) -> bool:

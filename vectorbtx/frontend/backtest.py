@@ -31,6 +31,7 @@ _FRONTEND_ARGS = frozenset(
         "instruments", "entries", "exits", "short_entries", "short_exits",
         "weights", "schedule",
         "stop_points", "target_points", "trail_points",
+        "stop_price", "target_price", "trail_price",
         "volume", "rates", "fx", "account_currency", "base_currency", "fx_markup",
         "min_trade", "leverage_budget", "holidays", "financing_markup", "carry_markup",
         "cash", "entry_priority", "when_cash_short", "risk_of",
@@ -66,11 +67,16 @@ def PortfolioBacktest(
     stake=None,
     notional=None,
     size=None,
+    notional_pct=None,
     risk_of=None,
     # --- stops, in points ---
     stop_points=None,
     target_points=None,
     trail_points=None,
+    # --- stops, as price levels ---
+    stop_price=None,
+    target_price=None,
+    trail_price=None,
     # --- data ---
     volume=None,
     rates=None,
@@ -108,23 +114,34 @@ def PortfolioBacktest(
         short_entries, short_exits: boolean short signal frames, alongside or instead of
             `entries`/`exits`. Shifted to the next bar exactly like them.
         weights, schedule: target weights and rebalance mask → rebalanced strategy.
-        risk_pct, risk_amount, stake, notional, size: **exactly one.** Two raises.
-            `risk_pct` and `risk_amount` size each entry to lose that risk at its stop,
-            from whichever stop is given (`stop_points`, `sl_stop` or a trailing stop's
-            first distance). With no stop, a position is worth the risk times its leverage:
-            its margin is the risk, an implied stop 1 / leverage of the price away, and no
-            stop is placed (a warning says so).
-        risk_of: what `risk_pct` is a fraction of: `"init_cash"` (the default, the same
-            amount on every trade), `"balance"` (cash after closed trades, costs and
-            holding costs so far) or `"equity"` (the balance plus open positions marked at
-            the close). Read at the close of the signal bar, the last value known when the
-            order is sent. Separate accounts read their own column; a shared account reads
-            the account. See Notes.
+        risk_pct, risk_amount, stake, notional, size, notional_pct: **exactly one.** Two
+            raises. `risk_pct` and `risk_amount` size each entry to lose that risk at its
+            stop, from whichever stop is given (`stop_points`, `sl_stop`, `stop_price`, or
+            a trailing stop's first distance). With no stop, a position is worth the risk
+            times its leverage: its margin is the risk, an implied stop 1 / leverage of the
+            price away, and no stop is placed (a warning says so). `notional_pct` sizes
+            each position to be worth that fraction of the account (`0.5` is half of it;
+            above 1 is levered, funded up to the leverage); a number, or one per column.
+        risk_of: what `risk_pct` or `notional_pct` is a fraction of: `"init_cash"` (the
+            default, the same amount on every trade), `"balance"` (cash after closed
+            trades, costs and holding costs so far) or `"equity"` (the balance plus open
+            positions marked at the close). Read at the close of the signal bar, the last
+            value known when the order is sent. Separate accounts read their own column; a
+            shared account reads the account. See Notes.
         stop_points, target_points, trail_points: stops in points, converted internally
             to the native price fractions. Each takes a number, one value per column (a
             dict, or a list in column order), or a DataFrame per bar, aligned with the
             signals and shifted with them. A trailing stop in points stays that many
             points behind the best price.
+        stop_price, target_price, trail_price: the stop or target as a price **level**
+            (an EMA, a swing low), the same shapes, aligned with the signals and shifted
+            with them: the level at the signal bar's close is where the stop or target
+            sits from the fill on, whatever the gap to the next open. A level on the wrong
+            side of the fill (a long's stop at or above it) is an order a broker rejects:
+            the entry is not placed, and a warning counts them. `trail_price` starts at
+            the signal bar's level and moves the stop to each completed bar's level,
+            never loosening it (a chandelier exit). Each leg is given once: a level
+            cannot sit beside the same leg in points or as `sl_stop` / `tp_stop`.
         volume: volume frame, required by `slippage="auto"`.
         rates: benchmark rate table (Section M), required by `financing="auto"`.
         fx: an `FXTable` for converting foreign-currency fixed costs.
@@ -204,9 +221,9 @@ def PortfolioBacktest(
         used from the fill. vectorbt alone reads a per-bar `sl_stop` at the fill bar, a bar
         late — lookahead. A scalar or per-column `sl_stop` passes through unchanged.
 
-        **`risk_pct` sizes off `init_cash` by default**, the same amount on every trade.
-        `risk_of="balance"` or `"equity"` sizes each entry from the account at its signal
-        bar instead. Those depend on every fill, cost and stop before the entry, so the
+        **`risk_pct` and `notional_pct` size off `init_cash` by default**, the same amount
+        on every trade. `risk_of="balance"` or `"equity"` sizes each entry from the account
+        at its signal bar instead. Those depend on every fill, cost and stop before the entry, so the
         backtest is simulated again, sized from the previous run's account, until no
         entry's size changes. Each size depends only on bars before it, so this ends, and
         the result is exactly what sizing inside the simulation would give; it typically
@@ -286,18 +303,20 @@ def PortfolioBacktest(
     cash = resolve_cash_model(
         cash,
         strategy,
-        sized=any(v is not None for v in (risk_pct, risk_amount, stake, notional, size)),
+        sized=any(v is not None for v in (risk_pct, risk_amount, stake, notional, size,
+                                          notional_pct)),
         sim_kwargs=sim_kwargs,
         entry_priority=entry_priority,
         when_cash_short=when_cash_short,
     )
-    risk_of = _check_risk_of(risk_of, risk_pct, risk_amount, init_cash)
+    risk_of = _check_risk_of(risk_of, risk_pct, notional_pct, init_cash)
 
     # ⚠️ ALL FOUR signal arrays shift, not just the long pair. Short signals used to arrive
     # in `**kwargs` and reach vectorbt unshifted, so every short filled at the open of the
     # bar whose close produced it: lookahead on every short. They are shifted once, here,
     # before `prepare`, so the sizing warnings can measure the bars orders are placed on.
     signals = None
+    sides = None
     order_bars = None
     native_stops = {}
     if strategy == "signals":
@@ -307,7 +326,8 @@ def PortfolioBacktest(
             short_entries=_next_bar(short_entries, close),
             short_exits=_next_bar(short_exits, close),
         )
-        order_bars = _opening_bars(signals, close, sim_kwargs.get("direction"))
+        sides = _opening_sides(signals, close, sim_kwargs.get("direction"))
+        order_bars = sides["long"] | sides["short"]
         # vectorbt's own stops are resolved with the front door's, so a per-bar one is
         # shifted with the signals and risk sizing can read it (issue 26).
         native_stops = {name: sim_kwargs.pop(name) for name in ("sl_stop", "tp_stop", "sl_trail")
@@ -326,10 +346,13 @@ def PortfolioBacktest(
             entries=entries, exits=exits, weights=weights, schedule=schedule,
             short_entries=short_entries, short_exits=short_exits,
             risk_pct=risk_pct, risk_amount=risk_amount, stake=stake,
-            notional=notional, size=size,
+            notional=notional, size=size, notional_pct=notional_pct,
             stop_points=stop_points, target_points=target_points, trail_points=trail_points,
             sl_stop=native_stops.get("sl_stop"), tp_stop=native_stops.get("tp_stop"),
             sl_trail=native_stops.get("sl_trail"),
+            stop_price=stop_price, target_price=target_price, trail_price=trail_price,
+            long_open=sides["long"] if sides else None,
+            short_open=sides["short"] if sides else None,
             volume=volume, rates=rates, fx=fx, base_currency=account_currency,
             fx_markup=fx_markup, fx_markup_currency=converted_to, point_fx=point_fx,
             init_cash=init_cash,
@@ -433,28 +456,46 @@ def PortfolioBacktest(
                     "callback needs as plain per-bar arrays instead of templates to avoid it.",
                     stacklevel=3,
                 )
-            if ctx["trail_distance"] is not None:
+            # An entry whose stop or target level is on the wrong side of its fill is an
+            # order a broker rejects, so it is not placed.
+            placing = _drop_rejected(signals, sides, ctx["rejected"], price)
+            trailing = [name for name, key in (("trail_points", "trail_distance"),
+                                               ("trail_price", "trail_level"))
+                        if ctx[key] is not None]
+            if trailing:
                 # A trailing stop in points keeps its distance behind the best price
-                # rather than becoming a fraction of the fill (issue 27). It is a stop
-                # adjustment callback of its own, so it cannot share the slot with one.
+                # rather than becoming a fraction of the fill (issue 27), and one at a level
+                # ratchets to each completed bar's level. Each is a stop-adjustment callback
+                # of its own, so it cannot share the slot with one.
                 from .split_bars import _custom
-                from .trail import trail_points_nb
+                from .trail import trail_level_nb, trail_points_nb
 
                 if _custom(kw.get("adjust_sl_func_nb")):
                     raise BacktestError(
-                        "`trail_points` keeps a trailing stop a fixed distance behind the best "
-                        "price with a stop-adjustment callback of its own, so it cannot be "
-                        "combined with `adjust_sl_func_nb`. Trail inside your callback, or use "
-                        "a trailing stop in % of the price (`sl_stop=` with `sl_trail=True`)."
+                        f"`{trailing[0]}` moves the trailing stop with a stop-adjustment "
+                        f"callback of its own, so it cannot be combined with "
+                        f"`adjust_sl_func_nb`. Trail inside your callback, or use a trailing "
+                        f"stop in % of the price (`sl_stop=` with `sl_trail=True`)."
                     )
-                kw["adjust_sl_func_nb"] = trail_points_nb
-                kw["adjust_sl_args"] = (
-                    np.ascontiguousarray(ctx["trail_distance"].to_numpy(dtype=np.float64)),
-                    2 if split else 1,
-                )
+                steps = 2 if split else 1
+                if ctx["trail_distance"] is not None:
+                    kw["adjust_sl_func_nb"] = trail_points_nb
+                    kw["adjust_sl_args"] = (
+                        np.ascontiguousarray(ctx["trail_distance"].to_numpy(dtype=np.float64)),
+                        steps,
+                    )
+                else:
+                    n_cols = len(ctx["columns"])
+                    kw["adjust_sl_func_nb"] = trail_level_nb
+                    kw["adjust_sl_args"] = (
+                        np.ascontiguousarray(ctx["trail_level"].to_numpy(dtype=np.float64)),
+                        steps,
+                        np.full(n_cols, np.nan),                 # each position's stop so far
+                        np.full(n_cols, -1, dtype=np.int64),     # the entry it belongs to
+                    )
             if cash == "shared" and "call_seq" not in kw:
                 kw["call_seq"] = shared_call_seq(
-                    price.index, ctx["columns"], **signals,
+                    price.index, ctx["columns"], **placing,
                     entry_priority=_next_bar_scores(entry_priority, price),
                     seed=kw.get("seed"),
                     direction=kw.get("direction"),
@@ -462,7 +503,7 @@ def PortfolioBacktest(
                 )
             if split:
                 pf = simulate_split_bars(
-                    Portfolio, price, fill, high, low, price=fill, signals=signals,
+                    Portfolio, price, fill, high, low, price=fill, signals=placing,
                     call_seq=kw.pop("call_seq", None),
                     size=ctx["size"],
                     **order_kwargs,
@@ -472,7 +513,7 @@ def PortfolioBacktest(
             else:
                 pf = Portfolio.from_signals(
                     price,
-                    **signals,
+                    **placing,
                     size=ctx["size"],
                     open=fill,
                     high=high, low=low,       # so stops are checked intrabar
@@ -555,50 +596,77 @@ def _wants_holding_costs(universe, rates) -> bool:
 RISK_BASES = ("init_cash", "balance", "equity")
 
 
-def _check_risk_of(risk_of, risk_pct, risk_amount, init_cash) -> str:
+def _check_risk_of(risk_of, risk_pct, notional_pct, init_cash) -> str:
     """Validate `risk_of`; None means `"init_cash"`."""
     if risk_of is None:
         return "init_cash"
     if risk_of not in RISK_BASES:
         raise BacktestError(f"`risk_of` must be one of {list(RISK_BASES)}, got {risk_of!r}.")
     if risk_of != "init_cash":
-        if risk_pct is None:
+        if risk_pct is None and notional_pct is None:
             raise BacktestError(
-                "`risk_of` says what `risk_pct` is a fraction of, so it needs `risk_pct=`. "
-                "`risk_amount` is a fixed sum on every trade and has no basis."
+                "`risk_of` says what `risk_pct` or `notional_pct` is a fraction of, so it "
+                "needs one of them. `risk_amount`, `stake`, `notional` and `size` are fixed "
+                "on every trade and have no basis."
             )
         if init_cash is None:
             raise BacktestError("`risk_of` needs `init_cash=`, the account the run starts from.")
     return risk_of
 
 
-def _opening_bars(signals, close, direction) -> pd.DataFrame:
-    """The bars an order may open or add to a position: the shifted entries.
+def _signal_mask(signal, close) -> np.ndarray:
+    """A shifted signal as an `(n_bars, n_cols)` boolean array; None is all False."""
+    if signal is None:
+        return np.zeros(close.shape, dtype=bool)
+    if isinstance(signal, pd.Series) or np.ndim(signal) == 1:
+        row = np.asarray(signal, dtype=bool).ravel()
+        return np.repeat(row[:, None], close.shape[1], axis=1)
+    frame = pd.DataFrame(signal).reindex(index=close.index, columns=close.columns)
+    return frame.fillna(False).to_numpy(dtype=bool)
 
-    Exits close what is held and are not sized, so they are not counted, except where
-    `direction="both"` makes `exits` the short entries. An unknown or per-column
-    `direction` counts them too: measuring a bar too many is the safe side for a warning.
+
+def _opening_sides(signals, close, direction) -> dict:
+    """The bars long and short entries fill on, and which signal array opens each side.
+
+    With the short arrays, `entries` open longs and `short_entries` shorts. Without them,
+    `direction` decides: `entries` open longs (`"longonly"`) or shorts (`"shortonly"`), and
+    under `"both"` `exits` open the shorts. An unknown or per-column `direction` is read as
+    `"both"`: a bar measured too many is the safe side for a warning.
+
+    Returns:
+        dict with boolean frames `long` and `short`, and `long_key` / `short_key`, the
+        signal array opening each side (None for a side nothing opens).
     """
     from .cash import _direction_mode
 
-    def as_mask(signal):
-        if signal is None:
-            return np.zeros(close.shape, dtype=bool)
-        if isinstance(signal, pd.Series) or np.ndim(signal) == 1:
-            row = np.asarray(signal, dtype=bool).ravel()
-            return np.repeat(row[:, None], close.shape[1], axis=1)
-        return pd.DataFrame(signal).reindex(index=close.index, columns=close.columns) \
-            .fillna(False).to_numpy(dtype=bool)
-
-    opening = as_mask(signals["entries"]) | as_mask(signals["short_entries"])
-    if signals["short_entries"] is None and signals["short_exits"] is None:
+    if signals["short_entries"] is not None or signals["short_exits"] is not None:
+        long_key, short_key = "entries", "short_entries"
+    else:
         try:
-            both = _direction_mode(direction) == "both"
+            mode = _direction_mode(direction)
         except BacktestError:
-            both = True
-        if both:
-            opening |= as_mask(signals["exits"])
-    return pd.DataFrame(opening, index=close.index, columns=close.columns)
+            mode = "both"
+        long_key, short_key = {"longonly": ("entries", None), "shortonly": (None, "entries"),
+                               "both": ("entries", "exits")}[mode]
+    out = dict(long_key=long_key, short_key=short_key)
+    for side, key in (("long", long_key), ("short", short_key)):
+        mask = _signal_mask(signals[key], close) if key else np.zeros(close.shape, dtype=bool)
+        out[side] = pd.DataFrame(mask, index=close.index, columns=close.columns)
+    return out
+
+
+def _drop_rejected(signals, sides, rejected, close) -> dict:
+    """The shifted signals without the entries whose stop or target level was rejected."""
+    if rejected is None or not bool(rejected.to_numpy().any()):
+        return signals
+    out = dict(signals)
+    for side, key in (("long", sides["long_key"]), ("short", sides["short_key"])):
+        if key is None:
+            continue
+        drop = rejected.to_numpy(dtype=bool) & sides[side].to_numpy(dtype=bool)
+        kept = _signal_mask(out[key], close) & ~drop
+        out[key] = pd.DataFrame(kept, index=close.index, columns=close.columns)
+    return out
 
 
 def _sized_from_the_account(prepared, simulated, risk_of, init_cash, order_bars):

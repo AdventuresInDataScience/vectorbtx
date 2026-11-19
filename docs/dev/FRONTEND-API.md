@@ -447,6 +447,7 @@ Not examples — the full vocabulary, for lookup.
 
 ```python
 risk_pct=0.01          # fraction of the account risked per trade (risk_of)
+notional_pct=0.5       # each position worth half the account (risk_of)
 risk_amount=100        # absolute money at risk per trade
 stake=2.50             # instrument's own units: £/pt, lots, or shares
 notional=25_000        # target exposure per position
@@ -467,6 +468,9 @@ leverage, with a warning. See `docs/API.md`.
 stop_points=60          # or {"EURUSD": 60, "SPY": 300}, or a DataFrame per bar
 target_points=120
 trail_points=40         # stays 40 points behind the best price
+stop_price=ema_200      # or a level: the stop sits on the signal bar's EMA
+target_price=pivot_r1
+trail_price=chandelier  # moves to each completed bar's level, never loosens
 ```
 
 A per-bar stop is aligned with the signals and shifted with them, like `sl_stop` frames.

@@ -93,7 +93,7 @@ _PASSTHROUGH_ORDER_FIELDS = (
 )
 
 #: Exactly one of these may be given.
-SIZING_ARGS = ("risk_pct", "risk_amount", "stake", "notional", "size")
+SIZING_ARGS = ("risk_pct", "risk_amount", "stake", "notional", "size", "notional_pct")
 
 
 # ############# 1. Instrument normalisation ############# #
@@ -259,6 +259,7 @@ def resolve_size(
     stop_columns=None,
     risk_basis=None,
     order_bars=None,
+    notional_pct=None,
 ):
     """Turn exactly one sizing argument into engine-unit sizes.
 
@@ -272,6 +273,9 @@ def resolve_size(
         stake: size in the instrument's own units — £/pt, lots or shares.
         notional: target exposure per position.
         size: raw engine-unit passthrough; the escape hatch.
+        notional_pct: each position's value as a fraction of the account (`0.5` is half
+            of it): of `init_cash`, or of `risk_basis` when given. A number, or one per
+            column. Above 1 is a levered position, funded up to the leverage.
         stop_points: entry-to-stop distance in points — a number, or one per column. Used
             when `stop_distance` is not given; a per-bar frame here is read as it stands,
             on the fill bars (the front door shifts per-bar stops before calling).
@@ -281,8 +285,9 @@ def resolve_size(
             trailing stop's first distance). Overrides `stop_points`.
         stop_columns: the columns a stop was given for. A column with none is sized from
             its leverage (see Notes). Default: every column with a distance anywhere.
-        risk_basis: the money `risk_pct` is a fraction of, per fill bar and column — the
-            balance or equity at the signal bar's close (`risk_of`). Default `init_cash`.
+        risk_basis: the money `risk_pct` or `notional_pct` is a fraction of, per fill bar
+            and column — the balance or equity at the signal bar's close (`risk_of`).
+            Default `init_cash`.
         order_bars: boolean frame of the bars an order is placed on, for the warnings.
 
     Returns:
@@ -307,8 +312,9 @@ def resolve_size(
         call first, at whatever close-out level the broker sets. That is left out, and a
         warning says so.
 
-        `risk_pct` sizes off `init_cash` unless `risk_basis` is given; the front door's
-        `risk_of="balance" | "equity"` passes one, worked out from the simulation.
+        `risk_pct` and `notional_pct` size off `init_cash` unless `risk_basis` is given;
+        the front door's `risk_of="balance" | "equity"` passes one, worked out from the
+        simulation.
 
         `risk_pct` and `risk_amount` are separate arguments rather than one `risk=`
         disambiguated by magnitude. A guess dressed as a feature is exactly what D8's
@@ -316,7 +322,8 @@ def resolve_size(
     """
     given = {
         name: value
-        for name, value in zip(SIZING_ARGS, (risk_pct, risk_amount, stake, notional, size))
+        for name, value in zip(SIZING_ARGS, (risk_pct, risk_amount, stake, notional, size,
+                                             notional_pct))
         if value is not None
     }
     if len(given) > 1:
@@ -342,6 +349,26 @@ def resolve_size(
             init_cash=init_cash, stop_points=stop_points, stop_distance=stop_distance,
             stop_columns=stop_columns, risk_basis=risk_basis, order_bars=order_bars,
         )
+
+    if notional_pct is not None:
+        if init_cash is None and risk_basis is None:
+            raise BacktestError("`notional_pct` is a fraction of `init_cash`; give `init_cash=`.")
+        if isinstance(notional_pct, pd.DataFrame) or (
+            isinstance(notional_pct, pd.Series) and isinstance(notional_pct.index, pd.DatetimeIndex)
+        ):
+            raise BacktestError(
+                "`notional_pct` takes one value, or one per column (a dict or a list in "
+                "column order), not a value per bar."
+            )
+        share, named = stop_values(notional_pct, price.index, columns, "notional_pct")
+        missing = [c for c in columns if c not in named]
+        if missing:
+            raise BacktestError(f"`notional_pct` gives no value for {missing}.")
+        money = _account_money(price.index, columns, init_cash, risk_basis)
+        # A position worth that share of the account: engine size is value / price.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return pd.DataFrame(share.to_numpy(dtype=float) * money / price.to_numpy(dtype=float),
+                                index=price.index, columns=list(columns))
 
     if stake is not None:
         staked = _spread(stake, price, columns)
@@ -376,16 +403,8 @@ def _risk_sizes(universe, price, columns, risk_pct, risk_amount, init_cash, stop
     # --- the money at risk, per fill bar and column ---
     if risk_pct is None:
         amount = np.full(fill.shape, float(risk_amount))
-    elif risk_basis is not None:
-        basis = pd.DataFrame(risk_basis).reindex(index=index, columns=columns)
-        amount = float(risk_pct) * basis.to_numpy(dtype=float)
     else:
-        # `init_cash` may be per column — separate cash pools size their own risk. Keeping
-        # it per column matters: a £30,000 sleeve risking 1% is not the same trade as a
-        # £20,000 one, and collapsing to a scalar would silently equalise them.
-        cash = np.asarray(init_cash, dtype=float)
-        per = np.full(len(columns), float(cash)) if cash.ndim == 0 else cash.ravel()[: len(columns)]
-        amount = float(risk_pct) * np.broadcast_to(per, fill.shape)
+        amount = float(risk_pct) * _account_money(index, columns, init_cash, risk_basis)
 
     # --- the stop's distance in price, per fill bar and column ---
     if stop_distance is None and stop_points is not None:
@@ -457,6 +476,23 @@ def _risk_sizes(universe, price, columns, risk_pct, risk_amount, init_cash, stop
             stacklevel=4,
         )
     return pd.DataFrame(out, index=index, columns=columns)
+
+
+def _account_money(index, columns, init_cash, risk_basis) -> np.ndarray:
+    """The account a fractional size is a share of, per fill bar and column.
+
+    `risk_basis` (the balance or equity at each signal bar) when given, else `init_cash`.
+    `init_cash` may be per column — separate cash pools size their own trades. Keeping it
+    per column matters: a £30,000 sleeve risking 1% is not the same trade as a £20,000 one,
+    and collapsing to a scalar would silently equalise them.
+    """
+    shape = (len(index), len(columns))
+    if risk_basis is not None:
+        basis = pd.DataFrame(risk_basis).reindex(index=index, columns=list(columns))
+        return basis.to_numpy(dtype=float)
+    cash = np.asarray(init_cash, dtype=float)
+    per = np.full(len(columns), float(cash)) if cash.ndim == 0 else cash.ravel()[: len(columns)]
+    return np.broadcast_to(per, shape).astype(float)
 
 
 def quantize_engine_size(universe, engine_size, columns, order_bars=None):
@@ -632,7 +668,9 @@ def stop_values(value, index, columns, name):
 
 
 def stop_plan(universe, price, columns, stop_points=None, target_points=None,
-              trail_points=None, sl_stop=None, tp_stop=None, sl_trail=None, point_fx=None):
+              trail_points=None, sl_stop=None, tp_stop=None, sl_trail=None, point_fx=None,
+              stop_price=None, target_price=None, trail_price=None, long_open=None,
+              short_open=None):
     """Every stop and target, resolved: what vectorbt gets, and the distances sizing reads.
 
     Points are converted to the price fractions vectorbt's native `sl_stop` / `tp_stop`
@@ -645,6 +683,21 @@ def stop_plan(universe, price, columns, stop_points=None, target_points=None,
     so on a converted price it is `point_size x rate`; without the rate a 50-cent stop on a
     USD share converted to GBP sat 50 pence away (OpenStrategy Studio issue 29).
 
+    **Price levels** (`stop_price`, `target_price`, `trail_price`) are where the stop or
+    target sits, not how far away: an EMA, a swing low. Each is a level per bar (or a
+    number, or one per column), aligned with the signals and shifted with them, so the
+    level at the signal bar's close is the one used from the fill. A distance worked out at
+    that close (`close - ema`) would miss the gap to the next open and put the stop off the
+    level by it; a level does not. At the fill it becomes vectorbt's fraction of the fill
+    price on the right side for the entry — below the fill for a long's stop and a short's
+    target, above for a short's stop and a long's target — which needs `long_open` and
+    `short_open`, the bars each side's entries fill on. A level on the wrong side (a long's
+    stop at or above its fill) is an invalid order, and a broker rejects it: the entry is
+    returned in `rejected`, and the front door does not place it. Without the sides (a
+    direct call) each level is taken to be on the right side. `trail_price` starts the stop
+    at the signal bar's level and moves it to each completed bar's level after that,
+    never loosening it (a chandelier exit; see `vectorbtx.frontend.trail`).
+
     Returns:
         dict with
         * `stops` — keyword arguments for `from_signals` (`sl_stop`, `tp_stop`, `sl_trail`);
@@ -652,11 +705,29 @@ def stop_plan(universe, price, columns, stop_points=None, target_points=None,
           there is none, or None with no stop at all;
         * `stop_columns` — the columns a stop-loss argument named;
         * `trail_distance` — a trailing stop's distance in price at each fill bar, when it
-          was given in points (see `vectorbtx.frontend.trail`), else None.
+          was given in points (see `vectorbtx.frontend.trail`), else None;
+        * `trail_level` — `trail_price` per fill bar (the signal bar's level), else None;
+        * `rejected` — boolean frame of entries whose level is on the wrong side of the
+          fill, or None when no level was given.
 
     Raises:
-        BacktestError: when a stop or target is given both in points and natively.
+        BacktestError: when a stop or target is given more than once.
     """
+    losses = [name for name, value in (("stop_points", stop_points), ("trail_points", trail_points),
+                                       ("sl_stop", sl_stop), ("stop_price", stop_price),
+                                       ("trail_price", trail_price)) if value is not None]
+    if ("stop_price" in losses or "trail_price" in losses) and len(losses) > 1:
+        raise BacktestError(
+            f"Give the stop-loss once; got {losses}. vectorbt has one stop-loss slot, so a "
+            f"level (`stop_price`, `trail_price`) cannot sit beside a distance or another level."
+        )
+    if target_price is not None and (target_points is not None or tp_stop is not None):
+        raise BacktestError(
+            "Give the take-profit once: `target_price=` (a level), `target_points=` (in "
+            "points) or `tp_stop=` (a fraction of the price)."
+        )
+    if trail_price is not None and sl_trail is not None:
+        raise BacktestError("`trail_price` trails by itself; drop `sl_trail`.")
     if sl_stop is not None and (stop_points is not None or trail_points is not None):
         raise BacktestError(
             "Give the stop-loss once: `stop_points=` / `trail_points=` (in points) or "
@@ -717,6 +788,49 @@ def stop_plan(universe, price, columns, stop_points=None, target_points=None,
         stops[name] = native if np.ndim(native) == 0 else frame
         if name == "sl_stop":
             risk_distance, stop_columns = frame * fill, named
+
+    # As price levels, read at the signal bar and placed on the entry's side of the fill.
+    rejected = None
+    trail_level = None
+    if any(v is not None for v in (stop_price, target_price, trail_price)):
+        def side(signal):
+            if signal is None:
+                return np.zeros(fill.shape, dtype=bool)
+            frame = pd.DataFrame(signal).reindex(index=index, columns=list(columns))
+            return frame.fillna(False).to_numpy(dtype=bool)
+
+        known = long_open is not None or short_open is not None
+        longs, shorts = side(long_open), side(short_open)
+        one = longs ^ shorts                       # both at once is a conflict: no entry
+        rejected = np.zeros(fill.shape, dtype=bool)
+        for name, level_value in (("target_price", target_price), ("stop_price", stop_price),
+                                  ("trail_price", trail_price)):
+            if level_value is None:
+                continue
+            frame, named = stop_values(level_value, index, columns, name)
+            level = frame.to_numpy(dtype=float)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                below = (fill - level) / fill      # a long's stop, a short's target
+                above = (level - fill) / fill      # a short's stop, a long's target
+            for_long, for_short = (above, below) if name == "target_price" else (below, above)
+            if known:
+                fraction = np.where(longs & one, for_long, np.where(shorts & one, for_short, np.nan))
+                bad = one & np.isfinite(level) & np.isfinite(fill) & ~(fraction > 0)
+                fraction = np.where(bad, np.nan, fraction)
+                rejected |= bad
+            else:
+                fraction = np.abs(below)
+            fraction = pd.DataFrame(fraction, index=index, columns=list(columns))
+            if name == "target_price":
+                stops["tp_stop"] = fraction
+                continue
+            stops["sl_stop"] = fraction
+            risk_distance, stop_columns = fraction * fill, named
+            if name == "trail_price":
+                stops["sl_trail"] = True
+                trail_level = frame
+        rejected = pd.DataFrame(rejected, index=index, columns=list(columns))
+
     if sl_trail is not None:
         if isinstance(sl_trail, pd.DataFrame):
             stops["sl_trail"] = (sl_trail.reindex(index=index, columns=list(columns))
@@ -725,7 +839,7 @@ def stop_plan(universe, price, columns, stop_points=None, target_points=None,
             stops["sl_trail"] = sl_trail
 
     return dict(stops=stops, risk_distance=risk_distance, stop_columns=stop_columns,
-                trail_distance=trail_distance)
+                trail_distance=trail_distance, trail_level=trail_level, rejected=rejected)
 
 
 def resolve_stops(universe, price, columns, stop_points=None, target_points=None,
@@ -797,10 +911,12 @@ def prepare(
     short_entries=None,
     short_exits=None,
     # sizing
-    risk_pct=None, risk_amount=None, stake=None, notional=None, size=None,
+    risk_pct=None, risk_amount=None, stake=None, notional=None, size=None, notional_pct=None,
     # stops
     stop_points=None, target_points=None, trail_points=None,
     sl_stop=None, tp_stop=None, sl_trail=None,
+    stop_price=None, target_price=None, trail_price=None,
+    long_open=None, short_open=None,
     # data
     volume=None, rates=None, fx=None, base_currency=None,
     fx_markup=None, fx_markup_currency=None, point_fx=None,
@@ -818,6 +934,11 @@ def prepare(
     Args:
         sl_stop, tp_stop, sl_trail: vectorbt's own stop arguments, when given. A per-bar
             value is shifted with the signals, and risk sizing reads `sl_stop`.
+        stop_price, target_price, trail_price: the stop or target as a price level, per
+            bar and shifted with the signals (see `stop_plan`).
+        long_open, short_open: boolean frames of the bars long and short entries fill on,
+            which put a level on the right side of the fill. An entry whose level is on
+            the wrong side is not placed (`rejected`), and the warnings leave it out.
         base_currency: the ACCOUNT currency (the front door's `account_currency`).
         fx_markup: the FX conversion markup, a fraction. Charged as slippage on every
             column except those already quoted in the account currency.
@@ -834,7 +955,8 @@ def prepare(
 
     Returns:
         dict with `universe`, `strategy`, `columns`, `price`, `fill_price`, `size`,
-        `order_kwargs`, `stops`, `trail_distance` and `risk_distance`.
+        `order_kwargs`, `stops`, `trail_distance`, `trail_level`, `rejected` and
+        `risk_distance`.
     """
     spec_kwargs = dict(spec_kwargs or {})
     passthrough = dict(passthrough or {})
@@ -867,12 +989,20 @@ def prepare(
         universe, fill, columns,
         stop_points=stop_points, target_points=target_points, trail_points=trail_points,
         sl_stop=sl_stop, tp_stop=tp_stop, sl_trail=sl_trail, point_fx=point_fx,
+        stop_price=stop_price, target_price=target_price, trail_price=trail_price,
+        long_open=long_open, short_open=short_open,
     )
+    if plan["rejected"] is not None:
+        _warn_if_levels_rejected(plan["rejected"], order_bars)
+        if order_bars is not None:
+            # A rejected entry places no order, so it is not measured by the warnings.
+            order_bars = pd.DataFrame(order_bars).reindex(index=fill.index, columns=columns) \
+                .fillna(False).astype(bool) & ~plan["rejected"]
 
     engine_size = resolve_size(
         universe, fill, columns,
         risk_pct=risk_pct, risk_amount=risk_amount, stake=stake,
-        notional=notional, size=size, init_cash=init_cash,
+        notional=notional, size=size, notional_pct=notional_pct, init_cash=init_cash,
         stop_distance=plan["risk_distance"], stop_columns=plan["stop_columns"],
         risk_basis=risk_basis, order_bars=order_bars,
     )
@@ -903,7 +1033,8 @@ def prepare(
 
     warn_if_cash_constrained(universe, engine_size, fill, columns, init_cash,
                              partial=allow_partial, order_bars=order_bars,
-                             risk_basis=risk_basis if risk_pct is not None else None)
+                             risk_basis=risk_basis if (risk_pct is not None
+                                                       or notional_pct is not None) else None)
 
     return dict(
         universe=universe,
@@ -915,7 +1046,31 @@ def prepare(
         order_kwargs=order_kwargs,
         stops=plan["stops"],
         trail_distance=plan["trail_distance"],
+        trail_level=plan["trail_level"],
+        rejected=plan["rejected"],
         risk_distance=plan["risk_distance"],
+    )
+
+
+def _warn_if_levels_rejected(rejected, order_bars) -> None:
+    """Say how many entries were not placed because a level was on the wrong side."""
+    counts = rejected.sum(axis=0)
+    counts = counts[counts > 0]
+    if counts.empty:
+        return
+    if order_bars is not None:
+        totals = pd.DataFrame(order_bars).reindex(index=rejected.index, columns=rejected.columns)
+        totals = totals.fillna(False).astype(bool).sum(axis=0)
+        detail = ", ".join(f"{col}: {int(n)} of {int(totals[col])}" for col, n in counts.items())
+    else:
+        detail = ", ".join(f"{col}: {int(n)}" for col, n in counts.items())
+    warnings.warn(
+        f"Entries NOT PLACED because a stop or target level was on the wrong side of the "
+        f"price they would fill at ({detail}): a long's stop at or above its fill, or its "
+        f"target at or below it, and the reverse for a short. A broker rejects such an "
+        f"order. The level is read at the signal bar's close and the order fills at the "
+        f"next open, so a gap through the level rejects it too.",
+        stacklevel=4,
     )
 
 
