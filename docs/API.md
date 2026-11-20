@@ -158,7 +158,11 @@ order is sent. Separate accounts read their own column; a shared account reads t
 Both depend on every fill before the entry, so the backtest is simulated again, sized from
 the previous run's account, until no entry's size changes: each size depends only on
 earlier bars, so this ends, with exactly the result sizing inside the simulation would
-give (typically two to four runs). Warnings are those of the final run.
+give (typically two to four runs). ⚠️ An entry vectorbt has to cut to the cash (a levered
+account's loan is fixed at the start, so after gains cash and loan fund less than the
+leverage allows) takes a run of its own, since it is asked again at what was funded, on the
+size step: a long levered run that makes money and sizes near its limit can take one run
+per entry (at most two per entry bar, plus two). Warnings are those of the final run.
 
 **Stops in points**, converted internally to the native price fractions:
 `stop_points`, `target_points`, `trail_points`. Native `sl_stop` and `tp_stop` are still

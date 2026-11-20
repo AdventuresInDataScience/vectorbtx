@@ -1762,3 +1762,92 @@ def test_nothing_binding_is_simulated_once(monkeypatch):
     run(o, h, l, c, instruments={"X": EQUITY}, entries=mask(c.index, ["X"], [("X", 0), ("X", 4)]),
         exits=mask(c.index, ["X"], [("X", 2), ("X", 6)]), size=10, init_cash=10_000)
     assert len(calls) == 1
+
+
+# ############# 35. The warnings describe the backtest returned ############# #
+
+
+def _said(**kwargs):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        pf = run(**kwargs)
+    return pf, [str(item.message) for item in caught]
+
+
+def test_the_warnings_name_the_account_of_the_run_returned():
+    """Issue 35: the re-sizing loop re-issued the sizing warnings of the preparation that read the run
+    BEFORE the one returned. A spread bet with 20% slippage at 5x, each entry worth twice the balance,
+    three round trips on a flat 100, a minimum stake of 10. The first run sizes all three from the
+    starting cash (200 a point) and its balance at the third entry is -6,000; the run returned trades
+    200 and 40 a point, its balance there is 400, so the third entry asks for 8, under the minimum.
+    The warning said it "needs 12,000 ... but its leverage funds only -30,000" and nothing else."""
+    o, h, l, c = frames([100.0] * 30)
+    instrument = {"mode": "spreadbet", "point_size": 1.0, "quote_currency": "USD", "spread_points": 0.0,
+                  "leverage": 5.0, "min_size": 10.0, "slippage": 0.2}
+    pf, said = _said(o=o, h=h, l=l, c=c, instruments={"X": instrument},
+                     entries=mask(c.index, ["X"], [("X", 0), ("X", 10), ("X", 20)]),
+                     exits=mask(c.index, ["X"], [("X", 5), ("X", 15), ("X", 25)]),
+                     notional_pct=2.0, risk_of="balance", init_cash=10_000)
+    assert _sized_orders(pf) == [(1, "Buy", 200.0), (6, "Sell", 200.0), (11, "Buy", 40.0), (16, "Sell", 40.0)]
+    assert float(np.asarray(pf.value()).ravel()[20]) == pytest.approx(400.0)
+    assert not [text for text in said if "funded buying power" in text], said       # 800 fits in 5 x 400
+    assert any("minimum tradeable size" in text for text in said), said
+
+
+def test_a_run_that_settles_at_once_keeps_its_warnings():
+    """Nothing binding: the one run's sizing warnings are still said (here, entries under the minimum)."""
+    o, h, l, c = frames([100.0] * 10)
+    pf, said = _said(o=o, h=h, l=l, c=c, instruments={"X": dict(EQUITY, min_size=10.0)},
+                     entries=mask(c.index, ["X"], [("X", 0)]), exits=mask(c.index, ["X"], [("X", 4)]),
+                     size=5, init_cash=10_000)
+    assert len(pf.orders.records) == 0
+    assert any("minimum tradeable size" in text for text in said), said
+
+
+# ############# 36. Entries cut to the cash settle, one run each ############# #
+
+
+def _cut_to_the_cash():
+    """A 5x spread bet that wins every trade (1% a bar), six round trips, each entry worth 4.8 times the
+    equity at its signal bar: inside 5x, but a levered account's loan is fixed at the start (40,000), so
+    once the equity passes about 11,400 each entry is more than cash and loan can pay for."""
+    opens = [100.0 * 1.01 ** k for k in range(35)]
+    o, h, l, c = frames(opens)
+    instrument = {"mode": "spreadbet", "point_size": 1.0, "quote_currency": "USD", "spread_points": 0.0,
+                  "leverage": 5.0, "min_size": 1.0, "increment": 1.0}
+    return run(o, h, l, c, instruments={"X": instrument},
+               entries=mask(c.index, ["X"], [("X", bar) for bar in range(0, 30, 5)]),
+               exits=mask(c.index, ["X"], [("X", bar) for bar in range(3, 30, 5)]),
+               notional_pct=4.8, risk_of="equity", init_cash=10_000)
+
+
+def test_entries_cut_to_the_cash_settle_one_run_each(monkeypatch):
+    """Issue 36: each entry cut to the cash took two runs (asked afresh and cut, then asked at that ceiling,
+    whose account had moved by then), against a limit of one per entry bar, so this raised RuntimeError
+    after 8 runs. The sizes are the ones the old loop reaches given as many runs as it needs."""
+    import vectorbtx.core.portfolio as module
+
+    calls = []
+    original = module.Portfolio.from_signals.__func__
+
+    def counted(cls, *args, **kwargs):
+        calls.append(1)
+        return original(cls, *args, **kwargs)
+
+    monkeypatch.setattr(module.Portfolio, "from_signals", classmethod(counted))
+    pf = _cut_to_the_cash()
+    buys = [size for _, side, size in _sized_orders(pf) if side == "Buy"]
+    assert buys == [475.0, 484.0, 475.0, 465.0, 456.0, 447.0]          # whole stakes, on the size step
+    assert len(_sized_orders(pf)) == 12 and _held_at_end(pf) == 0.0
+    assert len(calls) <= 6 + 2, len(calls)                                # the old loop took 11
+
+
+def test_a_run_that_cannot_settle_raises_a_backtest_error(monkeypatch):
+    """If the entries ever fail to settle, the error is a BacktestError, which a caller recording runs it
+    cannot make (an optimiser's trials) records, not a RuntimeError that stops it."""
+    import vectorbtx.frontend.backtest as module
+    from vectorbtx.frontend.prepare import BacktestError
+
+    monkeypatch.setattr(module, "_same_sizes", lambda new, old, placed: False)
+    with pytest.raises(BacktestError, match="did not settle after 14 runs"):           # 2 x 6 entry bars + 2
+        _cut_to_the_cash()

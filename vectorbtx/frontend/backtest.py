@@ -230,8 +230,9 @@ def PortfolioBacktest(
         backtest is simulated again, sized from the previous run's account, until no
         entry's size changes. Each size depends only on bars before it, so this ends, and
         the result is exactly what sizing inside the simulation would give; it typically
-        takes two to four runs. Holding costs are charged after each run, so the balance
-        and equity include them.
+        takes two to four runs, and one more for each entry vectorbt has to cut to the cash
+        (`_settle`). Holding costs are charged after each run, so the balance and equity
+        include them.
 
     Examples:
         >>> pf = vbt.x.PortfolioBacktest(
@@ -700,41 +701,66 @@ def _settle(prepared, simulated, risk_of, order_bars, partial):
     the starting cash, far inside its leverage, never short of cash) is simulated once.
 
     It ends, and exactly: each of the three depends only on the account at the bar before the
-    entry, so a run whose first k entries are settled settles entry k + 1 on the next, and
-    never undoes the first k. There are at most as many runs as entry bars, plus one; in
-    practice two to four.
+    entry, so once the first k entries are settled, the account entry k + 1 sees is final, and
+    it settles within two runs: one that asks it afresh on that account (vectorbt cuts it, if
+    the cash is short, to what is funded) and one that asks it at that ceiling. A settled entry
+    is never undone. So there are at most two runs per entry bar, plus two; one per entry cut
+    to the cash in practice, and a single run when nothing binds.
 
-    Warnings are recorded on each run and those of the final one re-issued, so each is said
-    once, about the backtest returned.
+    ⚠️ Only the ceilings up to each account's first change are applied on the next run
+    (`_current_ceilings`). An entry after it will see another account, and asked at its old
+    ceiling (rounded down) it is mostly filled in full, which says nothing of what the new
+    account funds; asking it afresh there and cutting it a run later took two runs for every
+    entry cut to the cash, and a long levered run that made money gave up after one run per
+    entry bar (OpenStrategy Studio issue 36).
+
+    Warnings are recorded on each step and said once, about the backtest returned: the
+    simulation's from the run returned, and the sizing's from the last preparation, the one
+    that read the run returned and found its sizes settled. ⚠️ Not the preparation that made
+    those sizes: it read the run before, whose account can be far from the one returned (the
+    first run sizes every entry from the starting cash, and after heavy losses its account can
+    be below zero), so its words named an account the backtest never had and could leave out
+    the real reason an entry was not placed (OpenStrategy Studio issue 35).
     """
     placed = order_bars.to_numpy(dtype=bool)
-    limit = int(placed.any(axis=1).sum()) + 2
+    # A bound, by the argument above, not a guess: two runs per entry bar, plus two.
+    limit = 2 * int(placed.any(axis=1).sum()) + 2
     kept = {}
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        ctx = prepared()
-        pf = simulated(ctx)
-    said = list(caught)
+    def recorded(step, *args):
+        """One step, and the warnings it raised, kept apart from every other step's."""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            out = step(*args)
+        return out, list(caught)
+
+    ctx, sizing_said = recorded(prepared)
+    pf, simulation_said = recorded(simulated, ctx)
 
     for _ in range(limit):
         equity = account_basis(pf, "equity")
         basis = None if risk_of == "init_cash" else (equity if risk_of == "equity" else account_basis(pf, risk_of))
         ceilings = _cash_ceilings(pf, ctx["size"], placed, equity, kept) if partial else None
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            following = prepared(basis, equity, ceilings)
-            if _same_sizes(following["size"], ctx["size"], placed):
-                break
-            pf = simulated(following)
-        ctx, said = following, list(caught)
+        # Read from `pf`'s own account: when the sizes are settled, these are the words about it.
+        following, sizing_said = recorded(prepared, basis, equity, ceilings)
+        if _same_sizes(following["size"], ctx["size"], placed):
+            break
+        if ceilings is not None:
+            current = _current_ceilings(ceilings, following["size"], ctx["size"], placed, pf)
+            if not np.array_equal(np.isnan(current.to_numpy()), np.isnan(ceilings.to_numpy())):
+                # Some entries after the first change are asked afresh instead (see above).
+                following, sizing_said = recorded(prepared, basis, equity, current)
+        ctx = following
+        pf, simulation_said = recorded(simulated, ctx)
     else:  # pragma: no cover - impossible by the argument above
-        raise RuntimeError(
+        # A BacktestError, so a caller that records a run it cannot make (an optimiser's trial)
+        # records this one too rather than stopping.
+        raise BacktestError(
             f"The entries did not settle after {limit} runs. Please report this: each one "
             f"depends only on earlier bars, so they should."
         )
 
-    for item in said:
+    for item in sizing_said + simulation_said:
         warnings.warn_explicit(item.message, item.category, item.filename, item.lineno)
     return pf
 
@@ -786,6 +812,32 @@ def _cash_ceilings(pf, asked, placed, equity, kept) -> pd.DataFrame:
         out[i, k] = opened[i, k] if np.isnan(out[i, k]) else min(out[i, k], opened[i, k])
         kept[(int(i), int(k))] = (out[i, k], account[i, k])
     return pd.DataFrame(out, index=pf.wrapper.index, columns=pf.wrapper.columns)
+
+
+def _current_ceilings(ceilings, new, old, placed, pf) -> pd.DataFrame:
+    """The ceilings to ask at on the next run: each account's up to its first entry that changes.
+
+    A ceiling is what an entry was funded on this run's account. On the next run the entry sees
+    that account again only if no entry before it, in its account, changes size; after the
+    first one that does (`new` against `old`, on the bars an order may be placed), it sees
+    another, so its ceiling is left out and it is asked afresh (OpenStrategy Studio issue 36;
+    `_settle`). Separate accounts are columns; a shared account (`cash_sharing` with a group)
+    is its group, whose first change leaves out the ceilings of every column after it. Entries
+    on the bar of the first change keep theirs.
+    """
+    with np.errstate(invalid="ignore"):
+        changed = placed & ~np.isclose(pd.DataFrame(new).to_numpy(dtype=float),
+                                       pd.DataFrame(old).to_numpy(dtype=float),
+                                       rtol=1e-12, atol=0.0, equal_nan=True)
+    roof = ceilings.to_numpy(dtype=float).copy()
+    columns = len(pf.wrapper.columns)
+    accounts = np.asarray(pf.wrapper.grouper.get_groups()) if pf.cash_sharing else np.arange(columns)
+    for account in np.unique(accounts):
+        members = np.nonzero(accounts == account)[0]
+        rows = np.nonzero(changed[:, members].any(axis=1))[0]
+        if len(rows):
+            roof[rows[0] + 1:, members] = np.nan
+    return pd.DataFrame(roof, index=ceilings.index, columns=ceilings.columns)
 
 
 def _same_sizes(new, old, placed) -> bool:

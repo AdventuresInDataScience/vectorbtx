@@ -29,6 +29,27 @@ The two optional parts of OpenStrategy Studio issues 23 and 26, and the leverage
   spoken for), it did so off the step (66.67 shares): the entry is now asked again at what
   was funded, rounded down. With `when_cash_short="skip"` an entry over the limit is not
   placed.
+- **The warnings describe the backtest returned** (issue 35). When `_settle` found the sizes
+  settled it re-issued the sizing warnings of the preparation that made them, which had read
+  the run before the one returned. The first run sizes every entry from the starting cash,
+  so after heavy losses its account can be far below zero: one warning said an entry "needs
+  12,000 ... but its leverage funds only -30,000" when the returned run's balance there was
+  400, and the real reason the entry was not placed (8 a point, under the minimum of 10) was
+  not said. Each step's warnings are now recorded apart, and the last preparation's (which
+  read the run returned) are said beside that run's own simulation warnings.
+- **Entries cut to the cash settle, one run each** (issue 36). A levered account's loan is
+  fixed at the start, so after gains its cash and loan fund less than the leverage allows,
+  and vectorbt cuts such entries to the cash, off the size step. Each was asked again at
+  what was funded, but that ceiling was dropped whenever the account before it had moved at
+  all, so it was asked afresh and cut again a run later: two runs per cut entry, against a
+  limit of one per entry bar, and a long levered run that made money raised `RuntimeError:
+  The entries did not settle` (a 5x spread bet on SPY at 0.2 risk over a 5% stop: 287 runs
+  needed, 250 allowed). Now only each account's ceilings up to its first entry that changes
+  are applied on the next run (`_current_ceilings`), so the entries after it are asked
+  afresh on the account they settle on, once; the limit is the bound the argument gives (two
+  runs per entry bar, plus two); and a run that still did not settle would raise
+  `BacktestError`. The same sizes as before (checked against the old loop given as many runs
+  as it needs, on that run and others); that run now takes 188.
 
 ### Changed
 
@@ -36,7 +57,7 @@ The two optional parts of OpenStrategy Studio issues 23 and 26, and the leverage
   (`frontend.backtest._settle`, which replaces `_sized_from_the_account`): the leverage limit
   from the equity, `risk_of`'s balance or equity, and the cash ceilings. A run where none of
   them binds is simulated once, exactly as before; one near its limit runs two to four
-  times. The buying-power warning measures each entry against the same equity, and says the
+  times, and once more for each entry vectorbt has to cut to the cash (issue 36). The buying-power warning measures each entry against the same equity, and says the
   entry is cut down (or not placed) rather than partially filled.
 
 ### Added
