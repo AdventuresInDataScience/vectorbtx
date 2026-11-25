@@ -22,6 +22,7 @@ import warnings
 import numpy as np
 import pandas as pd
 
+from ..core._numba import njit
 from .prepare import BacktestError, SIZING_ARGS, _SPEC_FIELDS, prepare, strategy_of
 
 #: Arguments this layer consumes itself. Anything else is forwarded to vectorbt, so the
@@ -575,6 +576,17 @@ def PortfolioBacktest(
                                  stacklevel=5)
         return pf
 
+    def charged(universe, index, columns, borrowed, notional, position):
+        """The holding costs positions like these pay, exactly as `simulated` charges a run: for the
+        re-sizing loop's fast passes, which have no `Portfolio` to charge (`replay.ledger_of_records`)."""
+        if not _wants_holding_costs(universe, rates):
+            return None
+        from ..holding.callback import holding_charges
+
+        return holding_charges(universe, index, columns, borrowed=borrowed, notional=notional,
+                               position=position, rates=rates, markup=financing_markup,
+                               carry_markup=carry_markup, holidays=holidays)
+
     sized = any(v is not None for v in (risk_pct, risk_amount, stake, notional, size, notional_pct))
     if strategy != "signals" or not sized or init_cash is None:
         return simulated(prepared())
@@ -582,7 +594,8 @@ def PortfolioBacktest(
     # leverage limit against the equity at each signal bar (issue 33), a share of the balance or
     # equity (`risk_of`), and an entry vectorbt had to cut to the cash re-asked at what was
     # funded, on the size step (issue 34). A run where none of that binds is simulated once.
-    return _settle(prepared, simulated, risk_of, order_bars, bool(sim_kwargs.get("allow_partial", True)))
+    return _settle(prepared, simulated, risk_of, order_bars, bool(sim_kwargs.get("allow_partial", True)),
+                   charged=charged)
 
 
 def _wants_holding_costs(universe, rates) -> bool:
@@ -681,7 +694,7 @@ def _drop_rejected(signals, sides, rejected, close) -> dict:
     return out
 
 
-def _settle(prepared, simulated, risk_of, order_bars, partial):
+def _settle(prepared, simulated, risk_of, order_bars, partial, charged=None):
     """Settle every entry against the account as the run goes, then return the backtest.
 
     Three things about an entry depend on every fill, cost and stop before it, so none can be
@@ -721,6 +734,15 @@ def _settle(prepared, simulated, risk_of, order_bars, partial):
     first run sizes every entry from the starting cash, and after heavy losses its account can
     be below zero), so its words named an account the backtest never had and could leave out
     the real reason an entry was not placed (OpenStrategy Studio issue 35).
+
+    ⚠️ **The passes between the first run and the last are made on arrays** (OpenStrategy Studio
+    issue 37, `vectorbtx.frontend.replay`): vectorbt's kernel replayed with the new sizes, the account
+    read from its order records, the sizes from `prepare`'s own sizing (`ctx["resize"]`). Each pass
+    used to prepare the run twice and build a whole `Portfolio`, about 30 ms around a 1 ms simulation,
+    so a run that grows with its account could take seconds. The fast passes only find the sizes: the
+    run they settle on is then prepared and simulated as before, and the loop below, unchanged, checks
+    that it is settled (one more preparation) before it is returned. Where the fast passes are not
+    covered or do not reproduce the first run exactly, the loop runs as before from the start.
     """
     placed = order_bars.to_numpy(dtype=bool)
     # A bound, by the argument above, not a guess: two runs per entry bar, plus two.
@@ -734,52 +756,97 @@ def _settle(prepared, simulated, risk_of, order_bars, partial):
             out = step(*args)
         return out, list(caught)
 
+    def unsettled():
+        # A BacktestError, so a caller that records a run it cannot make (an optimiser's trial)
+        # records this one too rather than stopping.
+        return BacktestError(
+            f"The entries did not settle after {limit} runs. Please report this: each one "
+            f"depends only on earlier bars, so they should."
+        )
+
+    from .replay import capture, fast_runner, ledger_of
+
     ctx, sizing_said = recorded(prepared)
-    pf, simulation_said = recorded(simulated, ctx)
+    (pf, simulation_said), call = capture(lambda: recorded(simulated, ctx))
+
+    # --- the fast passes: the same loop on arrays, to find the sizes the run settles on ---
+    # Set up only when a pass is needed, so a run that settles at once pays nothing for them.
+    moved = False
+    if not ctx["costs_follow_size"]:
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            sizes, ledger, fast = ctx["size"], ledger_of(pf), None
+            for _ in range(limit):
+                equity = _basis(ledger, "equity")
+                basis = None if risk_of == "init_cash" else (equity if risk_of == "equity" else _basis(ledger, risk_of))
+                ceilings = _cash_ceilings(ledger, sizes, placed, equity, kept) if partial else None
+                following = ctx["resize"](basis, equity, ceilings)
+                if _same_sizes(following, sizes, placed):
+                    break
+                if ceilings is not None:
+                    current = _current_ceilings(ceilings, following, sizes, placed, ledger)
+                    if not np.array_equal(np.isnan(current.to_numpy()), np.isnan(ceilings.to_numpy())):
+                        following = ctx["resize"](basis, equity, current)
+                fast = fast or fast_runner(call, pf, ctx["size"], charged=charged, universe=ctx["universe"])
+                if fast is None:
+                    break                   # not covered, or did not reproduce the first run: as before
+                sizes, moved = following, True
+                ledger = fast["ledger"](fast["simulate"](sizes))
+            else:
+                raise unsettled()
+    if moved:
+        # The run the fast passes settled on, prepared and simulated as the loop below would, from
+        # the last pass's account: the loop then finds it settled at once, with its own words.
+        ctx, sizing_said = recorded(prepared, basis, equity, ceilings)
+        pf, simulation_said = recorded(simulated, ctx)
 
     for _ in range(limit):
-        equity = account_basis(pf, "equity")
-        basis = None if risk_of == "init_cash" else (equity if risk_of == "equity" else account_basis(pf, risk_of))
-        ceilings = _cash_ceilings(pf, ctx["size"], placed, equity, kept) if partial else None
+        ledger = ledger_of(pf)
+        equity = _basis(ledger, "equity")
+        basis = None if risk_of == "init_cash" else (equity if risk_of == "equity" else _basis(ledger, risk_of))
+        ceilings = _cash_ceilings(ledger, ctx["size"], placed, equity, kept) if partial else None
         # Read from `pf`'s own account: when the sizes are settled, these are the words about it.
         following, sizing_said = recorded(prepared, basis, equity, ceilings)
         if _same_sizes(following["size"], ctx["size"], placed):
             break
         if ceilings is not None:
-            current = _current_ceilings(ceilings, following["size"], ctx["size"], placed, pf)
+            current = _current_ceilings(ceilings, following["size"], ctx["size"], placed, ledger)
             if not np.array_equal(np.isnan(current.to_numpy()), np.isnan(ceilings.to_numpy())):
                 # Some entries after the first change are asked afresh instead (see above).
                 following, sizing_said = recorded(prepared, basis, equity, current)
         ctx = following
         pf, simulation_said = recorded(simulated, ctx)
     else:  # pragma: no cover - impossible by the argument above
-        # A BacktestError, so a caller that records a run it cannot make (an optimiser's trial)
-        # records this one too rather than stopping.
-        raise BacktestError(
-            f"The entries did not settle after {limit} runs. Please report this: each one "
-            f"depends only on earlier bars, so they should."
-        )
+        raise unsettled()
 
     for item in sizing_said + simulation_said:
         warnings.warn_explicit(item.message, item.category, item.filename, item.lineno)
     return pf
 
 
-def _opened_sizes(pf) -> np.ndarray:
+def _opened_sizes(ledger) -> np.ndarray:
     """The size each order opened, per bar and column, in engine units; NaN where none opened.
 
     An order from flat opens all of itself; one that reverses a position opens what is left
     after the close. Read from the order records in each column's own sequence, so an entry
     stopped out later in its own bar (split bars) still counts what it opened.
     """
-    records = pf.orders.values
-    n, m = len(pf.wrapper.index), len(pf.wrapper.columns)
+    records = ledger["records"]
+    order = np.lexsort((np.arange(len(records)), records["idx"], records["col"]))
+    return _opened_sizes_nb(order, records["col"], records["idx"], records["size"], records["side"],
+                            len(ledger["index"]), len(ledger["columns"]))
+
+
+@njit(cache=True)
+def _opened_sizes_nb(order, cols, idxs, sizes, sides, n, m):
+    """`_opened_sizes`' walk through the records, compiled: it runs on every pass of the re-sizing loop."""
     out = np.full((n, m), np.nan)
     position = np.zeros(m)
-    for r in np.lexsort((np.arange(len(records)), records["idx"], records["col"])):
-        col, i = int(records["col"][r]), int(records["idx"][r])
-        q = records["size"][r] if records["side"][r] == 0 else -records["size"][r]
-        before, after = position[col], position[col] + q
+    for r in order:
+        col, i = cols[r], idxs[r]
+        q = sizes[r] if sides[r] == 0 else -sizes[r]
+        before = position[col]
+        after = before + q
         if abs(after) < 1e-12:
             after = 0.0
         if after != 0.0 and (before == 0.0 or np.sign(after) != np.sign(before)):
@@ -788,7 +855,7 @@ def _opened_sizes(pf) -> np.ndarray:
     return out
 
 
-def _cash_ceilings(pf, asked, placed, equity, kept) -> pd.DataFrame:
+def _cash_ceilings(ledger, asked, placed, equity, kept) -> pd.DataFrame:
     """The most each entry may be asked for on the next run, as this run found it funded.
 
     An entry that opened less than it asked was cut by vectorbt to the cash, off the size step:
@@ -796,25 +863,32 @@ def _cash_ceilings(pf, asked, placed, equity, kept) -> pd.DataFrame:
     earlier run is kept while the equity at that entry's signal bar is unchanged, because the
     entry then sees the same account; when the account before it has changed, it is asked
     afresh. `kept` carries the ceilings from run to run: {(bar, column): (ceiling, equity)}.
+    `ledger`: the run's account (`_ledger`, or a fast pass's, `replay.ledger_of_records`).
     """
-    opened = _opened_sizes(pf)
+    opened = _opened_sizes(ledger)
     wanted = np.abs(pd.DataFrame(asked).to_numpy(dtype=float))
     account = pd.DataFrame(equity).to_numpy(dtype=float)
     out = np.full(wanted.shape, np.nan)
-    for (i, k), (roof, seen) in list(kept.items()):
-        if np.isclose(account[i, k], seen, rtol=1e-12, atol=0.0):
-            out[i, k] = roof
-        else:
-            del kept[(i, k)]
+    if kept:
+        # Which kept ceilings still see the same account, all at once (the test is np.isclose's).
+        cells = np.array(list(kept), dtype=np.int64).reshape(-1, 2)
+        roofs = np.array([value[0] for value in kept.values()], dtype=float)
+        seen = np.array([value[1] for value in kept.values()], dtype=float)
+        same = np.isclose(account[cells[:, 0], cells[:, 1]], seen, rtol=1e-12, atol=0.0)
+        for (i, k), roof, keep in zip(list(kept), roofs, same):
+            if keep:
+                out[i, k] = roof
+            else:
+                del kept[(i, k)]
     with np.errstate(invalid="ignore"):
         cut = placed & np.isfinite(opened) & np.isfinite(wanted) & (opened < wanted * (1.0 - 1e-9))
     for i, k in zip(*np.nonzero(cut)):
         out[i, k] = opened[i, k] if np.isnan(out[i, k]) else min(out[i, k], opened[i, k])
         kept[(int(i), int(k))] = (out[i, k], account[i, k])
-    return pd.DataFrame(out, index=pf.wrapper.index, columns=pf.wrapper.columns)
+    return pd.DataFrame(out, index=ledger["index"], columns=ledger["columns"])
 
 
-def _current_ceilings(ceilings, new, old, placed, pf) -> pd.DataFrame:
+def _current_ceilings(ceilings, new, old, placed, ledger) -> pd.DataFrame:
     """The ceilings to ask at on the next run: each account's up to its first entry that changes.
 
     A ceiling is what an entry was funded on this run's account. On the next run the entry sees
@@ -830,8 +904,8 @@ def _current_ceilings(ceilings, new, old, placed, pf) -> pd.DataFrame:
                                        pd.DataFrame(old).to_numpy(dtype=float),
                                        rtol=1e-12, atol=0.0, equal_nan=True)
     roof = ceilings.to_numpy(dtype=float).copy()
-    columns = len(pf.wrapper.columns)
-    accounts = np.asarray(pf.wrapper.grouper.get_groups()) if pf.cash_sharing else np.arange(columns)
+    columns = len(ledger["columns"])
+    accounts = ledger["groups"] if ledger["shared"] else np.arange(columns)
     for account in np.unique(accounts):
         members = np.nonzero(accounts == account)[0]
         rows = np.nonzero(changed[:, members].any(axis=1))[0]
@@ -871,49 +945,74 @@ def account_basis(pf, risk_of) -> pd.DataFrame:
         Separate accounts read their own column; a shared account (`cash_sharing` with a
         group) reads the account, so every column in it sizes from the same figure.
     """
-    columns = list(pf.wrapper.columns)
-    index = pf.wrapper.index
-    assets = pd.DataFrame(pf.assets(), index=index, columns=columns)
-    close = pd.DataFrame(pf.close, index=index, columns=columns)
-    open_pnl = assets * close - _cost_basis(pf, index, columns)
+    from .replay import ledger_of
 
-    if pf.cash_sharing:
-        groups = np.asarray(pf.wrapper.grouper.get_groups())
-        value = pd.DataFrame(pf.value())
-        start = np.atleast_1d(np.asarray(pf.get_init_cash(), dtype=float))
+    return _basis(ledger_of(pf), risk_of)
+
+
+def _basis(ledger, risk_of) -> pd.DataFrame:
+    """`account_basis` from a run's ledger: a `Portfolio`'s (`replay.ledger_of`) or the re-sizing loop's
+    fast pass's (`replay.ledger_of_records`), which holds the same numbers."""
+    columns = ledger["columns"]
+    index = ledger["index"]
+
+    def open_pnl():
+        # The open positions' profit or loss, for the balance only.
+        assets = pd.DataFrame(ledger["assets"], index=index, columns=columns)
+        close = pd.DataFrame(ledger["close"], index=index, columns=columns)
+        return assets * close - _cost_basis(ledger["records"], index, columns)
+
+    if ledger["shared"]:
+        groups = ledger["groups"]
+        value = pd.DataFrame(ledger["value"])
+        start = ledger["start"]
+        pnl = open_pnl() if risk_of == "balance" else None
         out = {}
         for k, col in enumerate(columns):
             members = [columns[j] for j in range(len(columns)) if groups[j] == groups[k]]
             account = value.iloc[:, groups[k]].to_numpy(dtype=float)
             if risk_of == "balance":
-                account = account - open_pnl[members].sum(axis=1).to_numpy(dtype=float)
+                account = account - pnl[members].sum(axis=1).to_numpy(dtype=float)
             out[col] = np.concatenate([[start[groups[k]]], account[:-1]])
         return pd.DataFrame(out, index=index)
 
-    value = pd.DataFrame(pf.value(group_by=False), index=index, columns=columns)
+    # Separate accounts, on arrays: the same element-wise arithmetic as on frames, without them.
+    value = np.asarray(ledger["value"], dtype=float)
     if risk_of == "balance":
-        value = value - open_pnl
-    start = np.broadcast_to(np.asarray(pf.get_init_cash(group_by=False), dtype=float),
-                            (len(columns),))
-    shifted = value.shift(1)
-    shifted.iloc[0] = start
-    return shifted
+        held = np.asarray(ledger["assets"], dtype=float) * np.asarray(ledger["close"], dtype=float)
+        value = value - (held - _cost_basis_array(ledger["records"], len(index), len(columns)))
+    shifted = np.empty_like(value)
+    shifted[0] = ledger["start"]
+    shifted[1:] = value[:-1]
+    return pd.DataFrame(shifted, index=index, columns=columns)
 
 
-def _cost_basis(pf, index, columns) -> pd.DataFrame:
+def _cost_basis(records, index, columns) -> pd.DataFrame:
     """What each column's open position cost, at each bar's close: size x average entry.
 
     Zero when flat. Fees are not in it (they left the cash when paid), so cash plus the
-    cost basis is the balance.
+    cost basis is the balance. `records`: the run's order records, on its bars.
     """
-    records = pf.orders.values
+    return pd.DataFrame(_cost_basis_array(records, len(index), len(columns)), index=index, columns=columns)
+
+
+def _cost_basis_array(records, n, m) -> np.ndarray:
+    """`_cost_basis` as an `(n, m)` array."""
     signed = np.where(records["side"] == 0, records["size"], -records["size"])
     order = np.lexsort((np.arange(len(records)), records["idx"], records["col"]))
-    out = np.full((len(index), len(columns)), np.nan)
-    position = np.zeros(len(columns))
-    basis = np.zeros(len(columns))
+    return _cost_basis_nb(order, records["col"], records["idx"], np.asarray(signed, dtype=np.float64),
+                          records["price"], n, m)
+
+
+@njit(cache=True)
+def _cost_basis_nb(order, cols, idxs, signed, prices, n, m):
+    """`_cost_basis`' walk through the records, compiled, each column's last cost carried forward
+    over the bars with no order and zero before its first (as `.ffill().fillna(0.0)`)."""
+    out = np.full((n, m), np.nan)
+    position = np.zeros(m)
+    basis = np.zeros(m)
     for r in order:
-        col, i, q, p = int(records["col"][r]), int(records["idx"][r]), signed[r], records["price"][r]
+        col, i, q, p = cols[r], idxs[r], signed[r], prices[r]
         before = position[col]
         after = before + q
         if abs(after) < 1e-12:
@@ -924,10 +1023,17 @@ def _cost_basis(pf, index, columns) -> pd.DataFrame:
             cost = basis[col] * after / before         # reducing: the average stays
         else:
             cost = after * p                           # reversed: the new side at this price
-        position[col], basis[col] = after, cost
+        position[col] = after
+        basis[col] = cost
         out[i, col] = cost
-    frame = pd.DataFrame(out, index=index, columns=columns).ffill().fillna(0.0)
-    return frame
+    for k in range(m):
+        last = 0.0
+        for i in range(n):
+            if np.isnan(out[i, k]):
+                out[i, k] = last
+            else:
+                last = out[i, k]
+    return out
 
 
 def _resolve_currencies(account_currency, base_currency, spec_kwargs, instruments):

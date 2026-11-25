@@ -1851,3 +1851,147 @@ def test_a_run_that_cannot_settle_raises_a_backtest_error(monkeypatch):
     monkeypatch.setattr(module, "_same_sizes", lambda new, old, placed: False)
     with pytest.raises(BacktestError, match="did not settle after 14 runs"):           # 2 x 6 entry bars + 2
         _cut_to_the_cash()
+
+
+# ############# 37. The re-sizing loop's passes, made on arrays ############# #
+
+
+def _passes(name):
+    """A run that settles over many passes, one of each kind the fast passes cover (OpenStrategy Studio
+    issue 37): every one grows a levered account, so its entries keep outgrowing what was asked."""
+    import vectorbtx as vbt
+
+    rises = [100.0 * 1.01 ** k for k in range(205)]
+    o, h, l, c = frames(rises)
+    bet = {"mode": "spreadbet", "point_size": 1.0, "quote_currency": "USD", "spread_points": 0.0,
+           "leverage": 5.0, "min_size": 1.0, "increment": 1.0}
+    entries = mask(c.index, ["X"], [("X", bar) for bar in range(0, 200, 5)])
+    exits = mask(c.index, ["X"], [("X", bar) for bar in range(3, 200, 5)])
+    common = dict(o=o, h=h, l=l, c=c, instruments={"X": bet}, entries=entries, exits=exits, init_cash=10_000)
+    if name == "cut to the cash":
+        return dict(common, notional_pct=4.8, risk_of="equity")
+    if name == "a share of the balance, a stop in %":
+        return dict(common, risk_pct=0.2, risk_of="balance", sl_stop=0.05)
+    if name == "a trailing stop in points":
+        return dict(common, risk_pct=0.2, risk_of="balance", trail_points=4.0)
+    if name == "holding costs":
+        rates = vbt.x.static_rate_table(["USD"], c.index, {"USD": 0.05})
+        return dict(common, notional_pct=4.8, risk_of="equity", rates=rates)
+    if name == "skip when cash is short":
+        return dict(common, notional_pct=4.8, risk_of="equity", when_cash_short="skip")
+    if name == "shorts in a falling market":
+        falls = [100.0 * 0.99 ** k for k in range(205)]
+        o, h, l, c = frames(falls)
+        none = mask(c.index, ["X"])
+        return dict(common, o=o, h=h, l=l, c=c, entries=none, exits=none, short_entries=entries,
+                    short_exits=exits, notional_pct=4.8, risk_of="equity")
+    if name == "shared cash":
+        o, h, l, c = frames(rises, columns=("X", "Y"))
+        both = [(col, bar) for col in ("X", "Y") for bar in range(0, 200, 5)]
+        out = [(col, bar) for col in ("X", "Y") for bar in range(3, 200, 5)]
+        return dict(common, o=o, h=h, l=l, c=c, instruments={"X": bet, "Y": bet},
+                    entries=mask(c.index, ["X", "Y"], both), exits=mask(c.index, ["X", "Y"], out),
+                    notional_pct=2.4, risk_of="equity", cash="shared", when_cash_short="partial")
+    raise KeyError(name)
+
+
+_PASSES = ["cut to the cash", "a share of the balance, a stop in %", "a trailing stop in points", "holding costs",
+           "skip when cash is short", "shorts in a falling market", "shared cash"]
+
+
+def _orders_of(pf):
+    records = pf.orders.values
+    return {name: records[name].copy() for name in records.dtype.names}
+
+
+@pytest.mark.parametrize("name", _PASSES)
+def test_the_fast_passes_give_the_loops_own_result(name, monkeypatch):
+    """Issue 37: the re-sizing loop's passes are made on arrays (vectorbt's kernel replayed with the new sizes,
+    the account from its order records), and give, bit for bit, what the loop gives without them: the same
+    orders, the same equity and the same warnings. And they are used, not refused."""
+    import vectorbtx.frontend.replay as replay
+
+    used = []
+    real = replay.fast_runner
+
+    def watched(*args, **kwargs):
+        out = real(*args, **kwargs)
+        used.append(out is not None)
+        return out
+
+    monkeypatch.setattr(replay, "fast_runner", watched)
+    fast, fast_said = _said(**_passes(name))
+    monkeypatch.setattr(replay, "fast_runner", lambda *args, **kwargs: None)       # the loop as it was
+    slow, slow_said = _said(**_passes(name))
+    assert used == [True], used
+    if name == "holding costs":
+        assert fast.holding_costs is not None
+    a, b = _orders_of(fast), _orders_of(slow)
+    assert len(a["size"]) > 0
+    assert all(np.array_equal(a[key], b[key], equal_nan=True) for key in a), name
+    assert np.array_equal(np.asarray(fast.value()), np.asarray(slow.value()), equal_nan=True)
+    assert fast_said == slow_said
+
+
+def test_a_run_cut_to_the_cash_builds_the_whole_run_twice(monkeypatch):
+    """Issue 37: forty entries cut to the cash took 41 whole runs (each prepared twice and built into a
+    Portfolio, about 30 ms around a 1 ms simulation). Now the first run and the one it settles on are built;
+    the passes between are the kernel alone."""
+    import vectorbtx.core.portfolio as module
+    import vectorbtx.frontend.replay as replay
+
+    built, replayed = [], []
+    original = module.Portfolio.from_signals.__func__
+    real_replay = replay.replay
+
+    def counted(cls, *args, **kwargs):
+        built.append(1)
+        return original(cls, *args, **kwargs)
+
+    monkeypatch.setattr(module.Portfolio, "from_signals", classmethod(counted))
+    monkeypatch.setattr(replay, "replay", lambda *args: replayed.append(1) or real_replay(*args))
+    pf = run(**{k: v for k, v in _passes("cut to the cash").items()})
+    assert len(built) == 2, len(built)
+    assert len(replayed) >= 30, len(replayed)                    # one pass per entry cut, as before
+    assert _held_at_end(pf) == 0.0 and len(_sized_orders(pf)) == 80
+
+
+def test_costs_that_follow_the_size_keep_the_loop_as_it_was(monkeypatch):
+    """A minimum commission makes the costs depend on each order's size, so a pass would change the kernel's
+    costs too: such a run is not replayed, and still settles."""
+    import vectorbtx.frontend.replay as replay
+
+    called = []
+    monkeypatch.setattr(replay, "fast_runner", lambda *args, **kwargs: called.append(1))
+    kwargs = dict(_passes("cut to the cash"), notional_pct=0.9)
+    # Unlevered: levered and cut to the cash, a minimum commission does not settle (issue 38, open).
+    kwargs["instruments"] = {"X": dict(EQUITY, commission_pct=0.001, commission_min=1.0)}
+    pf = run(**kwargs)
+    assert not called
+    assert len(_sized_orders(pf)) == 80
+
+
+# ############# 38. A commission worked out from another order's size ############# #
+
+
+def _commissions(minimum):
+    """Half the starting cash per trade on a rising share: 49 shares at 100, 44 at 110.5, 40 at 122.1."""
+    opens = [100.0 * 1.01 ** k for k in range(40)]
+    o, h, l, c = frames(opens)
+    instrument = dict(EQUITY, commission_pct=0.001, commission_min=minimum)
+    pf = run(o, h, l, c, instruments={"X": instrument},
+             entries=mask(c.index, ["X"], [("X", 0), ("X", 10), ("X", 20)]),
+             exits=mask(c.index, ["X"], [("X", 5), ("X", 15), ("X", 25)]), notional_pct=0.5, init_cash=10_000)
+    records = pf.orders.values
+    return records["fees"], 0.001 * records["size"] * records["price"]
+
+
+def test_a_zero_minimum_commission_is_no_minimum():
+    """Issue 38: a minimum commission is worked out before the run into a per-bar fixed fee, from the sizes
+    frame, which on an exit's bar holds what an entry there would be, not the position it closes. A minimum
+    of zero (which OpenStrategy Studio fills a blank with) made every exit pay that other order's 0.1%:
+    4.99 for the exit of 49 shares at 106.15, not 5.20. A zero minimum is now no minimum, as a blank is."""
+    zero, own = _commissions(0.0)
+    blank, _ = _commissions(None)
+    assert np.allclose(zero, own, rtol=1e-12, atol=0.0), (zero, own)
+    assert np.array_equal(zero, blank)

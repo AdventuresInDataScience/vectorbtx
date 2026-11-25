@@ -33,7 +33,12 @@ class Commission(_Base):
         pct = spec.commission_pct or 0.0
         flat = spec.commission_flat or 0.0
         per_unit = spec.commission_per_unit or 0.0
-        minimum = spec.commission_min
+        # ⚠️ A minimum of zero is no minimum (OpenStrategy Studio issue 38). With one, the commission is
+        # worked out before the run into a per-bar fixed fee, from the sizes frame, which on an exit's bar
+        # holds the size an entry there would have, not the position the exit closes: a zero minimum
+        # turned an exact `pct` of each order's value into the wrong fee on every exit. Without one,
+        # vectorbt charges `pct` of each order's own value.
+        minimum = spec.commission_min if spec.commission_min else None
 
         base = ctx.get("base_currency")
         fx_table = ctx.get("fx_table")

@@ -162,7 +162,10 @@ give (typically two to four runs). ⚠️ An entry vectorbt has to cut to the ca
 account's loan is fixed at the start, so after gains cash and loan fund less than the
 leverage allows) takes a run of its own, since it is asked again at what was funded, on the
 size step: a long levered run that makes money and sizes near its limit can take one run
-per entry (at most two per entry bar, plus two). Warnings are those of the final run.
+per entry (at most two per entry bar, plus two). Warnings are those of the final run. The
+runs between the first and the last are made on arrays (`frontend.replay`): vectorbt's
+simulation replayed with the new sizes and the account read from its order records, a few
+milliseconds each on daily bars, not the whole pipeline; the result is the same, bit for bit.
 
 **Stops in points**, converted internally to the native price fractions:
 `stop_points`, `target_points`, `trail_points`. Native `sl_stop` and `tp_stop` are still

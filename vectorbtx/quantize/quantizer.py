@@ -60,14 +60,8 @@ def quantize(size, spec, direction=None):
         (0.0, 0.5)
     """
     spec = spec.filled()
-    direction = direction or spec.rounding or "floor"
     arr = np.asarray(size, dtype=np.float64)
-    sign = np.sign(arr)
-    mag = np.abs(arr)
-
-    q = _round_to(mag, spec.increment, direction)
-    q = np.where(q < spec.min_size - EPS, 0.0, q)
-    out = sign * q
+    out = quantize_filled(arr, spec, direction)
     drift = arr - out
 
     if np.isscalar(size) or np.ndim(size) == 0:
@@ -82,6 +76,20 @@ def quantize(size, spec, direction=None):
             pd.DataFrame(drift, index=size.index, columns=size.columns),
         )
     return out, drift
+
+
+def quantize_filled(arr, spec, direction=None) -> np.ndarray:
+    """`quantize`'s rounding, on a float array, for a spec that is already `filled()`.
+
+    The one place the rounding is done: `quantize` calls it, and so does the front door's
+    re-sizing loop, which quantizes the same columns on every pass and fills each spec once.
+    """
+    direction = direction or spec.rounding or "floor"
+    sign = np.sign(arr)
+    mag = np.abs(arr)
+    q = _round_to(mag, spec.increment, direction)
+    q = np.where(q < spec.min_size - EPS, 0.0, q)
+    return sign * q
 
 
 def to_order_params(spec, direction=None) -> dict:

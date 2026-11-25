@@ -7,6 +7,14 @@ The two optional parts of OpenStrategy Studio issues 23 and 26, and the leverage
 
 ### Fixed
 
+- ⚠️ **Changes results. A minimum commission of zero is no minimum** (OpenStrategy Studio issue
+  38). A minimum commission is worked out before the run into vectorbt's per-bar `fixed_fees`,
+  from the sizes frame, which on an exit's bar holds the size an entry there would have, not the
+  position the exit closes. With `commission_min=0.0` (OpenStrategy Studio fills a blank minimum
+  with it) a percentage commission took that route, so every exit paid another order's
+  commission whenever the sizes vary: 4.99 for the exit of 49 shares at 106.15, not 5.20. Now
+  vectorbt charges `commission_pct` of each order's own value, as with no minimum. A positive
+  minimum on an exit is still worked out from the sizes frame (open; issue 38's check).
 - **An exit always closes the whole position** (issue 32). The front door passed each
   instrument's leverage limit to vectorbt as `max_size = leverage x init_cash / price` on
   every bar, and vectorbt applies `max_size` to every order, the one that closes a position
@@ -53,6 +61,25 @@ The two optional parts of OpenStrategy Studio issues 23 and 26, and the leverage
 
 ### Changed
 
+- **The re-sizing loop's passes are made on arrays** (OpenStrategy Studio issue 37), about ten
+  times faster where a run takes many: each pass used to prepare the whole run twice and build
+  a whole `Portfolio`, about 30 ms of pandas and vectorbt wrapping around a 1 ms simulation, so
+  a 5x spread bet sized at 20% of its balance over 2,970 daily bars, 188 passes, took 5.4 s;
+  it now takes 0.47 s, and a run at its own settings 0.06 s (was 0.27 s). The results are the
+  same, bit for bit: the same orders, equity and warnings. The new `frontend.replay` captures the
+  kernel call `from_signals` makes on the first run and replays it with only `size` swapped,
+  reads the account from the order records with the same vectorbt dispatch functions
+  `Portfolio.value()` uses (holding costs charged as `apply_holding_costs` charges them, now
+  through `holding.callback.holding_charges`), and the sizes come from `prepare`'s own sizing
+  (`ctx["resize"]`), whose functions now share their arithmetic with the passes (the `*_core`
+  functions and `quantize.quantizer.quantize_filled`). Nothing is trusted that has not first
+  reproduced the first run bit for bit, and the run the passes settle on is prepared, simulated
+  and checked by the loop as before. Not covered, so run as before: costs that follow the size
+  (a commission per unit or with a minimum, automatic slippage) and a grouped portfolio without
+  shared cash. `_cost_basis` and `_opened_sizes` walk the records in numba. Tests in section 37
+  of `tests/test_upstream_fixes.py`: seven kinds of run that settle over many passes give the
+  loop's own result with and without the fast passes; a run of forty cut entries builds the whole
+  run twice (was 41).
 - Every sized rule strategy now settles its entries against the account as the run goes
   (`frontend.backtest._settle`, which replaces `_sized_from_the_account`): the leverage limit
   from the equity, `risk_of`'s balance or equity, and the cash ceilings. A run where none of

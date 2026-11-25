@@ -629,21 +629,40 @@ def apply_holding_costs(
         invested, where the charges would have throttled later positions. Use
         `Portfolio.from_holding_costs` there, and accept that it needs explicit sizes.
     """
-    charges = build_charges(
+    charges = holding_charges(
         universe,
         pf.wrapper.index,
+        list(pf.wrapper.columns),
         borrowed=pd.DataFrame(pf.x.borrowed_portion()),
         # Per column: under cash sharing the default is one series per group, which
         # charged every instrument on the whole account's positions.
         notional=pd.DataFrame(pf.asset_value(group_by=False)).abs(),
         position=pd.DataFrame(pf.assets()),
+        rates=rates, markup=markup, carry_markup=carry_markup, holidays=holidays,
+    )
+    return pf.replace(holding_costs=charges)
+
+
+def holding_charges(universe, index, columns, borrowed, notional, position, rates=None, markup=None,
+                    carry_markup=None, holidays=None):
+    """The per-bar holding-cost cash adjustments `apply_holding_costs` attaches, from the realised
+    positions: the borrowed notional, the absolute notional and the position, per bar and column.
+
+    Split out so the front door's re-sizing loop charges each fast pass exactly as a simulated
+    portfolio is charged (OpenStrategy Studio issue 37, `vectorbtx.frontend.replay`).
+    """
+    return build_charges(
+        universe,
+        index,
+        borrowed=borrowed,
+        notional=notional,
+        position=position,
         rates=rates,
         markup=_default_markup(markup),
         carry_markup=carry_markup,
         holidays=holidays,
-        columns=list(pf.wrapper.columns),
+        columns=columns,
     )
-    return pf.replace(holding_costs=charges)
 
 
 def _default_markup(markup):

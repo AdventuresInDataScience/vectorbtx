@@ -260,6 +260,7 @@ def resolve_size(
     risk_basis=None,
     order_bars=None,
     notional_pct=None,
+    keep=None,
 ):
     """Turn exactly one sizing argument into engine-unit sizes.
 
@@ -289,6 +290,9 @@ def resolve_size(
             and column — the balance or equity at the signal bar's close (`risk_of`).
             Default `init_cash`.
         order_bars: boolean frame of the bars an order is placed on, for the warnings.
+        keep: a dict that, for `risk_pct` and `notional_pct`, is given what the sizes are worked
+            out from besides the basis (`"share"`, the arrays), so the front door's re-sizing loop
+            can size again from another basis with the same arithmetic (`size_from_basis`).
 
     Returns:
         DataFrame of **engine-unit** sizes, or None when no sizing was given.
@@ -347,7 +351,7 @@ def resolve_size(
         return _risk_sizes(
             universe, price, columns, risk_pct=risk_pct, risk_amount=risk_amount,
             init_cash=init_cash, stop_points=stop_points, stop_distance=stop_distance,
-            stop_columns=stop_columns, risk_basis=risk_basis, order_bars=order_bars,
+            stop_columns=stop_columns, risk_basis=risk_basis, order_bars=order_bars, keep=keep,
         )
 
     if notional_pct is not None:
@@ -365,10 +369,10 @@ def resolve_size(
         if missing:
             raise BacktestError(f"`notional_pct` gives no value for {missing}.")
         money = _account_money(price.index, columns, init_cash, risk_basis)
-        # A position worth that share of the account: engine size is value / price.
-        with np.errstate(divide="ignore", invalid="ignore"):
-            return pd.DataFrame(share.to_numpy(dtype=float) * money / price.to_numpy(dtype=float),
-                                index=price.index, columns=list(columns))
+        shares, prices = share.to_numpy(dtype=float), price.to_numpy(dtype=float)
+        if keep is not None:
+            keep.update(share="notional_pct", shares=shares, prices=prices)
+        return pd.DataFrame(_notional_pct_core(shares, money, prices), index=price.index, columns=list(columns))
 
     if stake is not None:
         staked = _spread(stake, price, columns)
@@ -390,8 +394,41 @@ def resolve_size(
         )
 
 
+def _notional_pct_core(shares, money, prices) -> np.ndarray:
+    """A position worth that share of the account: engine size is value / price."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return shares * money / prices
+
+
+def _risk_core(amount, distance, fill, has_stop, leverage) -> np.ndarray:
+    """Engine sizes losing `amount` at the stop `distance`, or worth `amount x leverage` with no stop."""
+    out = np.full(fill.shape, np.nan)
+    for k in range(fill.shape[1]):
+        if has_stop[k]:
+            d = distance[:, k]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                out[:, k] = np.where(np.isfinite(d) & (d > 0), amount[:, k] / d, np.nan)
+        else:
+            # V = R x L: the trade's margin is the risk (issue 28).
+            with np.errstate(divide="ignore", invalid="ignore"):
+                out[:, k] = amount[:, k] * leverage[k] / fill[:, k]
+    return out
+
+
+def size_from_basis(keep, basis, risk_pct) -> np.ndarray:
+    """Sizes from another basis, with the arithmetic `resolve_size` used (`keep`, as it left it).
+
+    The front door's re-sizing loop (OpenStrategy Studio issue 37): `risk_pct` and `notional_pct`
+    sized again from each pass's balance or equity, without the frames around them.
+    """
+    money = np.asarray(basis, dtype=float)
+    if keep["share"] == "notional_pct":
+        return _notional_pct_core(keep["shares"], money, keep["prices"])
+    return _risk_core(float(risk_pct) * money, keep["distance"], keep["fill"], keep["has_stop"], keep["leverage"])
+
+
 def _risk_sizes(universe, price, columns, risk_pct, risk_amount, init_cash, stop_points,
-                stop_distance, stop_columns, risk_basis, order_bars):
+                stop_distance, stop_columns, risk_basis, order_bars, keep=None):
     """Engine-unit sizes that lose the risk at the stop, or from the leverage with none.
 
     See `resolve_size` for the rules; this is its risk branch.
@@ -436,23 +473,21 @@ def _risk_sizes(universe, price, columns, risk_pct, risk_amount, init_cash, stop
     else:
         placed = np.ones(fill.shape, dtype=bool)
 
-    out = np.full(fill.shape, np.nan)
+    has_stop = np.array([col in stop_columns for col in columns], dtype=bool)
+    leverage = np.array([float(universe[col].filled().leverage or 1.0) for col in columns])
+    out = _risk_core(amount, distance, fill, has_stop, leverage)
+    if keep is not None:
+        keep.update(share="risk", distance=distance, fill=fill, has_stop=has_stop, leverage=leverage)
     from_leverage = {}
     skipped = {}
     for k, col in enumerate(columns):
-        if col in stop_columns:
+        if has_stop[k]:
             d = distance[:, k]
-            with np.errstate(divide="ignore", invalid="ignore"):
-                out[:, k] = np.where(np.isfinite(d) & (d > 0), amount[:, k] / d, np.nan)
             missing = placed[:, k] & ~(np.isfinite(d) & (d > 0))
             if missing.any():
                 skipped[col] = (int(missing.sum()), int(placed[:, k].sum()))
         else:
-            # V = R x L: the trade's margin is the risk (issue 28).
-            leverage = float(universe[col].filled().leverage or 1.0)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                out[:, k] = amount[:, k] * leverage / fill[:, k]
-            from_leverage[col] = leverage
+            from_leverage[col] = float(leverage[k])
 
     if from_leverage:
         detail = ", ".join(
@@ -488,6 +523,11 @@ def _account_money(index, columns, init_cash, risk_basis) -> np.ndarray:
     """
     shape = (len(index), len(columns))
     if risk_basis is not None:
+        if (isinstance(risk_basis, pd.DataFrame) and list(risk_basis.columns) == list(columns)
+                and risk_basis.index.equals(index)):
+            # Already on these bars and columns (the front door's own basis): reindexing would copy
+            # the same values, on every pass of the re-sizing loop.
+            return risk_basis.to_numpy(dtype=float, copy=True)
         basis = pd.DataFrame(risk_basis).reindex(index=index, columns=list(columns))
         return basis.to_numpy(dtype=float)
     cash = np.asarray(init_cash, dtype=float)
@@ -543,8 +583,7 @@ def quantize_engine_size(universe, engine_size, columns, order_bars=None):
         spec = universe[col].filled()
         adapter = get_adapter(spec.mode)
         user = adapter.from_engine_units(frame[col].to_numpy(dtype=float), spec)
-        q_user, _ = quantize(pd.Series(user, index=frame.index), spec)
-        q_arr = np.asarray(q_user, dtype=float)
+        q_arr = _quantized_user(user, spec)
 
         # ⚠️ A size below the broker minimum quantizes to zero, and a zero-size order is
         # simply never placed — so the backtest runs, reports a flat equity curve and
@@ -569,6 +608,34 @@ def quantize_engine_size(universe, engine_size, columns, order_bars=None):
     return pd.DataFrame(out, index=frame.index)
 
 
+def _quantized_user(user, spec) -> np.ndarray:
+    """User-unit sizes rounded as `quantize` rounds them, for a filled spec."""
+    from ..quantize.quantizer import quantize_filled
+
+    return np.asarray(quantize_filled(np.asarray(user, dtype=np.float64), spec), dtype=float)
+
+
+def column_terms(universe, columns) -> list:
+    """Each column's filled spec and mode adapter, for the cores below; worked out once per run."""
+    from ..modes.base import get_adapter
+
+    out = []
+    for col in columns:
+        spec = universe[col].filled()
+        out.append((spec, get_adapter(spec.mode)))
+    return out
+
+
+def quantize_core(engine_size, terms) -> np.ndarray:
+    """`quantize_engine_size`'s rounding without its frames or warnings (the re-sizing loop's)."""
+    sizes = np.asarray(engine_size, dtype=float)
+    out = np.empty_like(sizes)
+    for k, (spec, adapter) in enumerate(terms):
+        user = adapter.from_engine_units(sizes[:, k], spec)
+        out[:, k] = adapter.to_engine_units(_quantized_user(user, spec), spec)
+    return out
+
+
 def _cells(value, shape) -> np.ndarray:
     """A resolved order field (a scalar, one value per column, or a frame) as one array per cell."""
     if value is None:
@@ -588,13 +655,48 @@ def _floor_engine(universe, col, engine_values) -> np.ndarray:
     would not fit it. Below the minimum size it is zero, so no order is placed.
     """
     from ..modes.base import get_adapter
-    from ..quantize.quantizer import quantize
 
     spec = universe[col].filled()
-    adapter = get_adapter(spec.mode)
+    return _floor_core(engine_values, spec, get_adapter(spec.mode))
+
+
+def _floor_core(engine_values, spec, adapter) -> np.ndarray:
+    """`_floor_engine` for a filled spec and its adapter."""
+    from ..quantize.quantizer import quantize_filled
+
     user = adapter.from_engine_units(np.abs(np.asarray(engine_values, dtype=float)), spec)
-    floored, _ = quantize(np.asarray(user, dtype=float), spec, direction="floor")
+    floored = quantize_filled(np.asarray(user, dtype=np.float64), spec, "floor")
     return np.asarray(adapter.to_engine_units(np.asarray(floored, dtype=float), spec), dtype=float)
+
+
+def cap_core(sizes, money, px, slip, fees, fixed, terms, partial) -> np.ndarray:
+    """`cap_to_leverage` on arrays, each column's leverage and size step from `terms`."""
+    out = np.array(sizes, dtype=float, copy=True)
+    for k, (spec, adapter) in enumerate(terms):
+        leverage = float(spec.leverage or 1.0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            limit = (leverage * money[:, k] - fixed[:, k]) / (px[:, k] * (1.0 + slip[:, k]) * (1.0 + fees[:, k]))
+            over = np.isfinite(out[:, k]) & np.isfinite(limit) & (np.abs(out[:, k]) > limit * (1.0 + 1e-9))
+        if not over.any():
+            continue
+        if partial:
+            floored = _floor_core(np.maximum(limit[over], 0.0), spec, adapter)
+            out[over, k] = np.sign(out[over, k]) * floored
+        else:
+            out[over, k] = np.nan
+    return out
+
+
+def ceiling_core(sizes, roof, terms) -> np.ndarray:
+    """`_apply_ceilings` on arrays."""
+    out = np.array(sizes, dtype=float, copy=True)
+    for k, (spec, adapter) in enumerate(terms):
+        has = np.isfinite(roof[:, k]) & np.isfinite(out[:, k])
+        if not has.any():
+            continue
+        floored = _floor_core(roof[has, k], spec, adapter)
+        out[has, k] = np.sign(out[has, k]) * np.minimum(np.abs(out[has, k]), floored)
+    return out
 
 
 def cap_to_leverage(universe, engine_size, price, columns, account, costs, partial=True) -> pd.DataFrame:
@@ -613,39 +715,24 @@ def cap_to_leverage(universe, engine_size, price, columns, account, costs, parti
     Sizes within the limit are returned as they are.
     """
     frame = pd.DataFrame(engine_size)[list(columns)]
-    shape = frame.shape
-    px = pd.DataFrame(price)[list(columns)].reindex(index=frame.index).to_numpy(dtype=float)
-    slip = _cells(costs.get("slippage"), shape)
-    fees = _cells(costs.get("fees"), shape)
-    fixed = _cells(costs.get("fixed_fees"), shape)
-    money = np.asarray(account, dtype=float)
-    out = frame.to_numpy(dtype=float).copy()
-    for k, col in enumerate(columns):
-        leverage = float(universe[col].filled().leverage or 1.0)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            limit = (leverage * money[:, k] - fixed[:, k]) / (px[:, k] * (1.0 + slip[:, k]) * (1.0 + fees[:, k]))
-            over = np.isfinite(out[:, k]) & np.isfinite(limit) & (np.abs(out[:, k]) > limit * (1.0 + 1e-9))
-        if not over.any():
-            continue
-        if partial:
-            floored = _floor_engine(universe, col, np.maximum(limit[over], 0.0))
-            out[over, k] = np.sign(out[over, k]) * floored
-        else:
-            out[over, k] = np.nan
+    arrays = cap_arrays(price, frame.index, columns, costs, frame.shape)
+    out = cap_core(frame.to_numpy(dtype=float), np.asarray(account, dtype=float), *arrays,
+                   column_terms(universe, columns), partial)
     return pd.DataFrame(out, index=frame.index, columns=list(columns))
+
+
+def cap_arrays(price, index, columns, costs, shape) -> tuple:
+    """`cap_to_leverage`'s price, slippage, fee and fixed-fee arrays, per bar and column."""
+    px = pd.DataFrame(price)[list(columns)].reindex(index=index).to_numpy(dtype=float)
+    return (px, _cells(costs.get("slippage"), shape), _cells(costs.get("fees"), shape),
+            _cells(costs.get("fixed_fees"), shape))
 
 
 def _apply_ceilings(universe, engine_size, ceilings, columns) -> pd.DataFrame:
     """Each entry no bigger than its ceiling (what an earlier run found funded), rounded down."""
     frame = pd.DataFrame(engine_size)[list(columns)]
     roof = pd.DataFrame(ceilings).reindex(index=frame.index, columns=list(columns)).to_numpy(dtype=float)
-    out = frame.to_numpy(dtype=float).copy()
-    for k, col in enumerate(columns):
-        has = np.isfinite(roof[:, k]) & np.isfinite(out[:, k])
-        if not has.any():
-            continue
-        floored = _floor_engine(universe, col, roof[has, k])
-        out[has, k] = np.sign(out[has, k]) * np.minimum(np.abs(out[has, k]), floored)
+    out = ceiling_core(frame.to_numpy(dtype=float), roof, column_terms(universe, columns))
     return pd.DataFrame(out, index=frame.index, columns=list(columns))
 
 
@@ -1093,16 +1180,6 @@ def prepare(
             order_bars = pd.DataFrame(order_bars).reindex(index=fill.index, columns=columns) \
                 .fillna(False).astype(bool) & ~plan["rejected"]
 
-    engine_size = resolve_size(
-        universe, fill, columns,
-        risk_pct=risk_pct, risk_amount=risk_amount, stake=stake,
-        notional=notional, size=size, notional_pct=notional_pct, init_cash=init_cash,
-        stop_distance=plan["risk_distance"], stop_columns=plan["stop_columns"],
-        risk_basis=risk_basis, order_bars=order_bars,
-    )
-    engine_size = quantize_engine_size(universe, engine_size, columns, order_bars=order_bars)
-    asked = engine_size
-
     def resolved_for(sizes):
         # ⚠️ No `equity=`, so no `max_size` (OpenStrategy Studio issue 32). vectorbt applies
         # `max_size` to EVERY order, the one that closes a position included: an exit worth more
@@ -1126,26 +1203,88 @@ def prepare(
                                                                         columns=columns),
         )
 
-    resolved = resolved_for(engine_size)
-    if engine_size is not None and (init_cash is not None or leverage_basis is not None):
-        # The leverage limit, on the entries only, measured against the equity at the signal
-        # bar when the front door knows it (issue 33), rounded down to the size step and
-        # allowing for the spread and commission, so vectorbt never has to cut the order to
-        # the cash itself (issue 34).
-        account = _account_money(fill.index, columns, init_cash, leverage_basis)
-        engine_size = cap_to_leverage(universe, engine_size, fill, columns, account, resolved,
-                                      partial=allow_partial)
-        if ceilings is not None:
-            engine_size = _apply_ceilings(universe, engine_size, ceilings, columns)
-        if not _same_frame(engine_size, asked):
-            # Size-dependent costs (a minimum commission, automatic slippage) follow the sizes
-            # actually ordered.
-            resolved = resolved_for(engine_size)
-    if engine_size is not None:
-        # Sizes are already quantized above, so the engine must not floor them again —
-        # doing so would knock a clean multiple down one further increment, and its floor
-        # would apply to the orders that close a position too (`sell_nb` floors a close).
-        resolved["size_granularity"] = np.nan
+    # Whether any cost depends on the size ordered: a commission per unit or with a minimum, or
+    # automatic slippage. Without one, the costs are the same whatever the sizes, so the re-sizing loop
+    # resolves them once (`kept`, below) and can replay the simulation with new sizes alone.
+    costs_follow_size = _costs_follow_size(universe, columns)
+    kept = {}
+
+    def sized(risk_basis, leverage_basis, ceilings):
+        """The entry sizes for one account basis, leverage basis and set of ceilings, the sizes asked
+        before the leverage limit, and the costs the sizes pay: `(size, asked, resolved)`.
+
+        `prepare` calls it once, and the front door's re-sizing loop again for each pass
+        (`ctx["resize"]`, OpenStrategy Studio issue 37), so the loop sizes exactly as a whole
+        preparation does. The first call goes through the whole functions and keeps their inputs; a
+        pass goes straight to the same arithmetic on them (the `*_core` functions, which the whole
+        functions call too): the share of the basis (`size_from_basis`), the rounding (`quantize_core`),
+        the leverage limit (`cap_core`) and the ceilings (`ceiling_core`). The sizes asked, when they
+        are not a share of a basis that moves, and the costs, when they do not follow the size, are
+        kept as they are.
+        """
+        moves = risk_basis is not None and (risk_pct is not None or notional_pct is not None)
+        again = "asked" in kept and not costs_follow_size          # a pass of the re-sizing loop
+        index = fill.index
+        if not again:
+            share = {}
+            engine_size = resolve_size(
+                universe, fill, columns,
+                risk_pct=risk_pct, risk_amount=risk_amount, stake=stake,
+                notional=notional, size=size, notional_pct=notional_pct, init_cash=init_cash,
+                stop_distance=plan["risk_distance"], stop_columns=plan["stop_columns"],
+                risk_basis=risk_basis, order_bars=order_bars, keep=share,
+            )
+            engine_size = quantize_engine_size(universe, engine_size, columns, order_bars=order_bars)
+            kept.update(asked=engine_size, share=share, terms=column_terms(universe, columns))
+        elif moves:
+            raw = size_from_basis(kept["share"], _account_money(index, columns, init_cash, risk_basis), risk_pct)
+            engine_size = quantize_core(raw, kept["terms"])          # an array, framed once, below
+        else:
+            engine_size = kept["asked"]
+        asked = engine_size
+
+        def costs(sizes):
+            if costs_follow_size:
+                return resolved_for(sizes)
+            if "costs" not in kept:
+                kept["costs"] = resolved_for(sizes)
+            return dict(kept["costs"])
+
+        resolved = costs(engine_size)
+        if engine_size is not None and (init_cash is not None or leverage_basis is not None):
+            # The leverage limit, on the entries only, measured against the equity at the signal
+            # bar when the front door knows it (issue 33), rounded down to the size step and
+            # allowing for the spread and commission, so vectorbt never has to cut the order to
+            # the cash itself (issue 34).
+            account = _account_money(index, columns, init_cash, leverage_basis)
+            if again:
+                capped = cap_core(np.asarray(asked, dtype=float), np.asarray(account, dtype=float), *kept["cap"],
+                                  kept["terms"], allow_partial)
+                if ceilings is not None:
+                    # The front door's ceilings are on these bars and columns already (`_account_money`).
+                    roof = _account_money(index, columns, None, ceilings)
+                    capped = ceiling_core(capped, roof, kept["terms"])
+                engine_size = pd.DataFrame(capped, index=index, columns=columns)
+            else:
+                engine_size = cap_to_leverage(universe, engine_size, fill, columns, account, resolved,
+                                              partial=allow_partial)
+                if ceilings is not None:
+                    engine_size = _apply_ceilings(universe, engine_size, ceilings, columns)
+                kept["cap"] = cap_arrays(fill, index, columns, resolved, engine_size.shape)
+            if costs_follow_size and not _same_frame(engine_size, asked):
+                # Size-dependent costs (a minimum commission, automatic slippage) follow the sizes
+                # actually ordered.
+                resolved = resolved_for(engine_size)
+        if engine_size is not None and not isinstance(engine_size, pd.DataFrame):
+            engine_size = pd.DataFrame(engine_size, index=index, columns=columns)
+        if engine_size is not None:
+            # Sizes are already quantized above, so the engine must not floor them again —
+            # doing so would knock a clean multiple down one further increment, and its floor
+            # would apply to the orders that close a position too (`sell_nb` floors a close).
+            resolved["size_granularity"] = np.nan
+        return engine_size, asked, resolved
+
+    engine_size, asked, resolved = sized(risk_basis, leverage_basis, ceilings)
     order_kwargs = collision_check(resolved, passthrough)
 
     warn_if_cash_constrained(universe, asked, fill, columns, init_cash,
@@ -1165,7 +1304,30 @@ def prepare(
         trail_level=plan["trail_level"],
         rejected=plan["rejected"],
         risk_distance=plan["risk_distance"],
+        # The re-sizing loop's passes (OpenStrategy Studio issue 37): the sizes for another account,
+        # sized as above. Its warnings are the caller's to keep or drop.
+        resize=lambda risk_basis, leverage_basis, ceilings: sized(risk_basis, leverage_basis, ceilings)[0],
+        costs_follow_size=costs_follow_size,
     )
+
+
+def _costs_follow_size(universe, columns) -> bool:
+    """Whether any column's costs depend on the size ordered (`vectorbtx.costs`).
+
+    A commission per unit, or one with a minimum, is a fixed fee worked out from each order's size or
+    notional; automatic slippage scales with the order against the volume. A spread bet pays no
+    commission. Every other cost is a fraction of the price or a fixed fee per order.
+    """
+    for col in columns:
+        spec = universe[col].filled()
+        if spec.slippage == "auto":
+            return True
+        if spec.mode == "spreadbet":
+            continue
+        # A minimum of zero is no minimum (`costs.commission`, issue 38).
+        if spec.commission_min or np.any(np.asarray(spec.commission_per_unit or 0.0) != 0.0):
+            return True
+    return False
 
 
 def _warn_if_levels_rejected(rejected, order_bars) -> None:
