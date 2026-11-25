@@ -154,7 +154,8 @@ risk, margin calls are not modelled, and a warning says so.
 | `"equity"` | the balance plus open positions marked at the close |
 
 The balance or equity is read at the close of the signal bar, the last value known when the
-order is sent. Separate accounts read their own column; a shared account reads the account.
+order is sent. An entry whose basis is at or below zero (an earlier trade lost more than the
+account) is not placed, with a warning: a share of nothing, or of a debt, is no position. Separate accounts read their own column; a shared account reads the account.
 Both depend on every fill before the entry, so the backtest is simulated again, sized from
 the previous run's account, until no entry's size changes: each size depends only on
 earlier bars, so this ends, with exactly the result sizing inside the simulation would

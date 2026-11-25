@@ -7,6 +7,19 @@ The two optional parts of OpenStrategy Studio issues 23 and 26, and the leverage
 
 ### Fixed
 
+- **A share of an account at or below zero is no order** (OpenStrategy Studio issue 40).
+  `risk_pct` or `notional_pct` of a balance below zero was a negative size. The leverage
+  cap, measured on the equity, left it as it was whenever the equity was above zero (an open
+  trade in profit), and vectorbt raised `ValueError: Negative size is not allowed` on any bar
+  with a signal, an exit included. The re-sizing loop reaches such an account on its way to
+  an answer: a pass sizes from the run before it, which can hold a trade its own account
+  could not have opened. So a run with an answer raised (about one trial in seven of a 5x
+  spread bet risking 13% to 19% of the balance over a 2% to 3% stop, which stopped the
+  Studio's optimisation jobs). Now such an entry is not placed (NaN, as an entry with no
+  stop distance), the same on the loop's fast passes (`size_from_basis`), and a warning says
+  which entries of the run returned were left out. Orders change only for runs that raised:
+  where the equity was at or below zero too, the cap already cut such an entry to zero, in
+  silence, and now the warning names it.
 - ⚠️ **Changes results. A minimum commission of zero is no minimum** (OpenStrategy Studio issue
   38). A minimum commission is worked out before the run into vectorbt's per-bar `fixed_fees`,
   from the sizes frame, which on an exit's bar holds the size an entry there would have, not the

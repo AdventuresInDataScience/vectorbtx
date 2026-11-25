@@ -1995,3 +1995,54 @@ def test_a_zero_minimum_commission_is_no_minimum():
     blank, _ = _commissions(None)
     assert np.allclose(zero, own, rtol=1e-12, atol=0.0), (zero, own)
     assert np.array_equal(zero, blank)
+
+
+# ############# 40. A share of an account at or below zero is no order ############# #
+
+
+def _after_a_wipe_out(**sizing):
+    """A 5x spread bet whose first trade gaps down 30% (bars 1 to 3) and loses more than the account, then a
+    second entry (bar 5) on a price that rises 5% a bar. The re-sizing loop's first run sizes the second entry
+    from the starting cash, so in that run it is open and in profit: the next pass reads a balance below zero
+    beside an equity above it at the second trade's exit."""
+    opens = [100.0, 100.0, 100.0, 70.0, 70.0, 70.0] + [70.0 * 1.05 ** k for k in range(1, 12)]
+    o, h, l, c = frames(opens)
+    instrument = {"mode": "spreadbet", "point_size": 1.0, "quote_currency": "USD", "spread_points": 0.0,
+                  "leverage": 5.0, "min_size": 1.0, "increment": 1.0}
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        pf = run(o, h, l, c, instruments={"X": instrument}, entries=mask(c.index, ["X"], [("X", 0), ("X", 5)]),
+                 exits=mask(c.index, ["X"], [("X", 3), ("X", 15)]), init_cash=10_000, **sizing)
+    return pf, [str(item.message) for item in caught]
+
+
+@pytest.mark.parametrize("sizing, size, sold", [
+    (dict(notional_pct=4.8, risk_of="balance"), 480.0, 4),             # the exit signal, at the next open
+    (dict(risk_pct=0.5, sl_stop=0.10, risk_of="balance"), 500.0, 3),   # the stop, at the gap's open
+    (dict(notional_pct=4.8, risk_of="equity"), 480.0, 4),
+    (dict(risk_pct=0.5, sl_stop=0.10, risk_of="equity"), 500.0, 3),
+])
+def test_an_account_below_zero_places_no_order(sizing, size, sold):
+    """Issue 40: a share of a balance below zero was a negative size, which the leverage cap (measured on the
+    equity, above zero there) left as it was, and vectorbt raised `ValueError: Negative size is not allowed`.
+    The first trade loses more than the account, so the second is not placed, whatever the basis."""
+    pf, said = _after_a_wipe_out(**sizing)
+    assert _sized_orders(pf) == [(1, "Buy", size), (sold, "Sell", size)]
+    assert _held_at_end(pf) == 0.0
+    assert float(np.asarray(pf.value()).ravel()[-1]) == pytest.approx(10_000 - size * 30.0)
+    below = [text for text in said if text.startswith("Entries on an account at or below zero")]
+    # Said once, about the run returned: one entry of two, from its own account at the signal bar.
+    assert len(below) == 1, said
+    assert f"X: 1 of 2, the first on 2024-01-09 at {10_000 - size * 30.0:,.0f}" in below[0], below[0]
+
+
+def test_an_account_above_zero_is_sized_as_before():
+    """The rule changes nothing while the account stays above zero: a share of it, on the size step."""
+    from vectorbtx.frontend.prepare import _money_above_zero, size_from_basis
+
+    money = np.array([[10_000.0, -5.0], [0.0, np.nan], [250.5, 1.0]])
+    assert np.array_equal(_money_above_zero(money), np.array([[10_000.0, np.nan], [np.nan, np.nan], [250.5, 1.0]]),
+                          equal_nan=True)
+    keep = {"share": "notional_pct", "shares": np.full((3, 2), 2.0), "prices": np.full((3, 2), 100.0)}
+    assert np.array_equal(size_from_basis(keep, money, None),
+                          np.array([[200.0, np.nan], [np.nan, np.nan], [5.01, 0.02]]), equal_nan=True)

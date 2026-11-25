@@ -368,7 +368,9 @@ def resolve_size(
         missing = [c for c in columns if c not in named]
         if missing:
             raise BacktestError(f"`notional_pct` gives no value for {missing}.")
-        money = _account_money(price.index, columns, init_cash, risk_basis)
+        # An account at or below zero gives no order (issue 40).
+        money = _money_above_zero(_account_money(price.index, columns, init_cash, risk_basis),
+                                  price.index, columns, order_bars)
         shares, prices = share.to_numpy(dtype=float), price.to_numpy(dtype=float)
         if keep is not None:
             keep.update(share="notional_pct", shares=shares, prices=prices)
@@ -415,13 +417,55 @@ def _risk_core(amount, distance, fill, has_stop, leverage) -> np.ndarray:
     return out
 
 
+def _money_above_zero(money, index=None, columns=None, order_bars=None) -> np.ndarray:
+    """The account a share is taken of, NaN (no order) where it is at or below zero.
+
+    OpenStrategy Studio issue 40. A share of a negative balance was a negative size. The leverage
+    cap leaves it as it is when the equity, which it is measured on, is above zero (an open trade
+    in profit), and vectorbt raises `ValueError: Negative size is not allowed` on any bar with a
+    signal, an exit included. The re-sizing loop reaches such an account on its way to a run
+    that settles: a pass sizes from the run before it, which can hold a trade its own account
+    could not have opened. So `risk_pct` or `notional_pct` of the balance raised on runs that
+    have an answer. A share of nothing, or of a debt, is no position: NaN, the sizing's "no
+    order", as an entry with no stop distance is.
+
+    With `order_bars` (a whole preparation, not one of the loop's passes) the entries left out
+    are said. The loop says the warnings of the preparation that read the run returned, so the
+    words describe that run (issue 35).
+    """
+    money = np.asarray(money, dtype=float)
+    out = np.where(money > 0, money, np.nan)              # NaN stays NaN
+    if order_bars is None:
+        return out
+    placed = pd.DataFrame(order_bars).reindex(index=index, columns=list(columns)).fillna(False)
+    placed = placed.to_numpy(dtype=bool)
+    hit = placed & np.isfinite(money) & (money <= 0)
+    if hit.any():
+        details = []
+        for k, col in enumerate(columns):
+            if not hit[:, k].any():
+                continue
+            first = int(np.argmax(hit[:, k]))
+            details.append(f"{col}: {int(hit[:, k].sum())} of {int(placed[:, k].sum())}, the first on "
+                           f"{_when(index[first])} at {money[first, k]:,.0f}")
+        warnings.warn(
+            f"Entries on an account at or below zero ({', '.join(details)}) cannot be sized as a "
+            f"share of it, so NO ORDER is placed on them. The account had lost everything before "
+            f"them: a smaller share, a wider stop or less leverage keeps it above zero.",
+            stacklevel=4,
+        )
+    return out
+
+
 def size_from_basis(keep, basis, risk_pct) -> np.ndarray:
     """Sizes from another basis, with the arithmetic `resolve_size` used (`keep`, as it left it).
 
     The front door's re-sizing loop (OpenStrategy Studio issue 37): `risk_pct` and `notional_pct`
-    sized again from each pass's balance or equity, without the frames around them.
+    sized again from each pass's balance or equity, without the frames around them. An account
+    at or below zero gives no order, as in `resolve_size` (issue 40), without its warning: a
+    pass's words are never said.
     """
-    money = np.asarray(basis, dtype=float)
+    money = _money_above_zero(basis)
     if keep["share"] == "notional_pct":
         return _notional_pct_core(keep["shares"], money, keep["prices"])
     return _risk_core(float(risk_pct) * money, keep["distance"], keep["fill"], keep["has_stop"], keep["leverage"])
@@ -441,7 +485,9 @@ def _risk_sizes(universe, price, columns, risk_pct, risk_amount, init_cash, stop
     if risk_pct is None:
         amount = np.full(fill.shape, float(risk_amount))
     else:
-        amount = float(risk_pct) * _account_money(index, columns, init_cash, risk_basis)
+        # An account at or below zero gives no order (issue 40).
+        money = _money_above_zero(_account_money(index, columns, init_cash, risk_basis), index, columns, order_bars)
+        amount = float(risk_pct) * money
 
     # --- the stop's distance in price, per fill bar and column ---
     if stop_distance is None and stop_points is not None:
