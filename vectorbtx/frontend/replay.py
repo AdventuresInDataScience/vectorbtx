@@ -102,11 +102,22 @@ def capture(run):
     return result, (calls[0] if len(calls) == 1 else None)
 
 
-def replay(call, size):
-    """The kernel's order records for the captured call with `size` in place of its own."""
+def replay(call, size, init_cash=None):
+    """The kernel's order records for the captured call with `size` in place of its own, and `init_cash` in
+    place of its starting cash when given (the margin loan the loop has grown, OpenStrategy Studio issue 41).
+
+    Both kernels take the starting cash third (`target_shape, group_lens, init_cash, call_seq, ...`), one
+    per cash group, as `from_signals` broadcast it.
+    """
+    args = _copied(call["args"])
+    if init_cash is not None:
+        args = list(args)
+        args[2] = np.require(np.broadcast_to(np.asarray(init_cash, dtype=float), np.shape(args[2])),
+                             dtype=np.asarray(args[2]).dtype).copy()
+        args = tuple(args)
     kwargs = _copied(call["kwargs"])
     kwargs["size"] = size
-    order_records, _ = call["kernel"](*_copied(call["args"]), **kwargs)
+    order_records, _ = call["kernel"](*args, **kwargs)
     return order_records
 
 
@@ -278,8 +289,13 @@ def fast_runner(call, pf, sizes, charged=None, universe=None):
         out = np.asarray(values, dtype=own.dtype)
         return np.asfortranarray(out) if own.flags.f_contiguous and not own.flags.c_contiguous else out
 
-    def simulate(new):
-        records = replay(call, kernel_size(new)).copy()
+    def simulate(new, loan=None):
+        # `loan`: the margin loan to fund the run with (issue 41), in place of the first run's; the
+        # starting cash moves by the difference, as `PortfolioBacktest`'s `simulated(ctx, loan)` moves it.
+        init_cash = None
+        if loan is not None:
+            init_cash = statics["init"] - statics["loan"] + np.asarray(loan, dtype=float)
+        records = replay(call, kernel_size(new), init_cash).copy()
         if split:
             records["idx"] //= 2                       # back onto the bars, as split_bars does
         return records

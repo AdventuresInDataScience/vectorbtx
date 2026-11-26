@@ -159,11 +159,18 @@ account) is not placed, with a warning: a share of nothing, or of a debt, is no 
 Both depend on every fill before the entry, so the backtest is simulated again, sized from
 the previous run's account, until no entry's size changes: each size depends only on
 earlier bars, so this ends, with exactly the result sizing inside the simulation would
-give (typically two to four runs). ⚠️ An entry vectorbt has to cut to the cash (a levered
-account's loan is fixed at the start, so after gains cash and loan fund less than the
-leverage allows) takes a run of its own, since it is asked again at what was funded, on the
-size step: a long levered run that makes money and sizes near its limit can take one run
-per entry (at most two per entry bar, plus two). Warnings are those of the final run. The
+give (typically two to four runs). A levered account's margin loan grows with it the same
+way: it starts at `init_cash x (leverage - 1)`, and when an entry asks for more than the
+account and its loan can pay for, the loan is raised to pay for it, up to the broker's
+rule (`leverage x` the equity at the signal bar, less what is open in a shared account), and
+the run is simulated again. So a grown account trades what its leverage allows (OpenStrategy
+Studio issue 41). A run the starting loan pays for is simulated on it, as before. ⚠️ An entry
+vectorbt still has to cut to the cash (an unlevered shared account whose cash is spoken for,
+or a shared account at its leverage on the whole account) takes a run of its own, since it
+is asked again at what was funded, on the size step (at most two runs per entry bar, plus
+two). ⚠️ The loan is one number for the whole run: in a shared account it is set by the
+entry that needs most, so after the account falls from there the whole account can hold up
+to `leverage x` that higher equity; each symbol's own limit still binds its entries. Warnings are those of the final run. The
 runs between the first and the last are made on arrays (`frontend.replay`): vectorbt's
 simulation replayed with the new sizes and the account read from its order records, a few
 milliseconds each on daily bars, not the whole pipeline; the result is the same, bit for bit.
@@ -312,7 +319,7 @@ price series in one backtest.
 ```python
 pf.x.user_size()       # position in £/pt, lots or shares — not engine units
 pf.x.unit_names()      # {"EURUSD=X": "£/point"}
-pf.margin_loan         # buying power beyond your own equity
+pf.margin_loan         # buying power beyond your own equity (grown with the account, issue 41)
 pf.holding_costs       # per-bar financing and carry, if rates were supplied
 pf.drift               # quantization and suppression drift, if rebalanced
 ```
@@ -1066,8 +1073,10 @@ output that looks plausible and is wrong.
 ## 12b. Margin, holding-cost and FX helpers
 
 ### `vbt.x.buying_power(universe, init_cash, columns, cash_sharing=False)` → `(engine_cash, loan)`
-Splits account **equity** into the engine's buying power and the broker's margin loan. Called
-for you by the front door; useful directly when building a portfolio by hand. See
+Splits account **equity** into the engine's buying power and the broker's margin loan, the
+loan a run starts from: `init_cash x (leverage - 1)`. Called for you by the front door, whose
+re-sizing loop grows the loan when a grown account needs more (issue 41); useful directly when
+building a portfolio by hand, where the loan stays fixed. See
 README → Leverage and margin.
 
 ### `vbt.x.leverage_of(universe, columns)` → `np.ndarray`

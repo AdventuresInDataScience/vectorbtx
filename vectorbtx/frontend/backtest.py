@@ -371,8 +371,14 @@ def PortfolioBacktest(
             passthrough=passthrough,
         )
 
-    def simulated(ctx):
-        """Simulate one resolved context and charge its holding costs."""
+    def simulated(ctx, loan=None):
+        """Simulate one resolved context and charge its holding costs.
+
+        `loan`: the margin loan to fund a levered account with, in `buying_power`'s basis (per
+        column, or the shared account's), when the re-sizing loop has grown it to what the account
+        has grown to (OpenStrategy Studio issue 41, `_settle`). None is `buying_power`'s own,
+        `init_cash x (leverage - 1)`, and the run is exactly as it always was.
+        """
         from ..core.portfolio import Portfolio
 
         kw = dict(sim_kwargs)
@@ -397,6 +403,13 @@ def PortfolioBacktest(
             engine_cash, margin_loan = buying_power(
                 universe, init_cash, ctx["columns"], cash_sharing=shares_cash,
             )
+            if loan is not None:
+                # The account is the same; only what vectorbt may draw on is more. Nothing
+                # reported moves with it: cash, value, borrowing and holding costs are all read
+                # with the loan taken back out (`Portfolio.get_init_cash`).
+                loan = np.asarray(loan, dtype=float)
+                engine_cash = np.asarray(engine_cash, dtype=float) - np.asarray(margin_loan, dtype=float) + loan
+                margin_loan = loan
             kw["init_cash"] = engine_cash
 
         if strategy == "weights":
@@ -595,7 +608,7 @@ def PortfolioBacktest(
     # equity (`risk_of`), and an entry vectorbt had to cut to the cash re-asked at what was
     # funded, on the size step (issue 34). A run where none of that binds is simulated once.
     return _settle(prepared, simulated, risk_of, order_bars, bool(sim_kwargs.get("allow_partial", True)),
-                   charged=charged)
+                   charged=charged, longs=sides["long"])
 
 
 def _wants_holding_costs(universe, rates) -> bool:
@@ -694,7 +707,7 @@ def _drop_rejected(signals, sides, rejected, close) -> dict:
     return out
 
 
-def _settle(prepared, simulated, risk_of, order_bars, partial, charged=None):
+def _settle(prepared, simulated, risk_of, order_bars, partial, charged=None, longs=None):
     """Settle every entry against the account as the run goes, then return the backtest.
 
     Three things about an entry depend on every fill, cost and stop before it, so none can be
@@ -703,11 +716,18 @@ def _settle(prepared, simulated, risk_of, order_bars, partial, charged=None):
     * its size, when it is a share of the balance or equity (`risk_of`);
     * its leverage limit, a position worth at most `leverage x` the equity at the signal bar
       (OpenStrategy Studio issue 33; `cap_to_leverage`);
-    * what an account can pay for, when vectorbt had to cut an entry to the cash (a levered
-      account's loan is fixed at the start, a shared account's cash is spoken for), which it
-      does off the size step: such an entry is asked again at what was funded, rounded down to
-      the size step, and kept there while the account at its signal bar stays the same
-      (issue 34; `_cash_ceilings`).
+    * what an account can pay for, when vectorbt had to cut an entry to the cash (a shared
+      account's cash is spoken for), which it does off the size step: such an entry is asked
+      again at what was funded, rounded down to the size step, and kept there while the account
+      at its signal bar stays the same (issue 34; `_cash_ceilings`);
+    * the margin loan a levered account is funded with (OpenStrategy Studio issue 41). It starts
+      at `init_cash x (leverage - 1)` (`buying_power`), and vectorbt bounds every long by the
+      cash, so an account that had grown could not pay for what its leverage allows: its entries
+      were cut to the cash and kept as ceilings. Now an entry that asked for more than the
+      account and its loan could pay for (`_unfunded`) is no ceiling; the loan is raised to pay
+      for what the next run asks, up to the broker's rule (`_loan_needed`), and that run is
+      simulated on it. The loan only grows, and a run the starting loan pays for keeps it, so
+      such a run is simulated exactly as before.
 
     So the backtest is run, each entry is settled from that run's account at its signal bar,
     and it is run again, until no entry's size changes. A run where nothing binds (a size from
@@ -745,6 +765,8 @@ def _settle(prepared, simulated, risk_of, order_bars, partial, charged=None):
     covered or do not reproduce the first run exactly, the loop runs as before from the start.
     """
     placed = order_bars.to_numpy(dtype=bool)
+    # Only a long is bounded by the cash in vectorbt's kernel (`buy_nb`; a short only under `lock_cash`).
+    longs = placed if longs is None else pd.DataFrame(longs).to_numpy(dtype=bool)
     # A bound, by the argument above, not a guess: two runs per entry bar, plus two.
     limit = 2 * int(placed.any(axis=1).sum()) + 2
     kept = {}
@@ -764,24 +786,28 @@ def _settle(prepared, simulated, risk_of, order_bars, partial, charged=None):
             f"depends only on earlier bars, so they should."
         )
 
+    from ..margin.buying_power import leverage_of
     from .replay import capture, fast_runner, ledger_of
 
     ctx, sizing_said = recorded(prepared)
     (pf, simulation_said), call = capture(lambda: recorded(simulated, ctx))
+    leverage = leverage_of(ctx["universe"], ctx["columns"])
 
     # --- the fast passes: the same loop on arrays, to find the sizes the run settles on ---
     # Set up only when a pass is needed, so a run that settles at once pays nothing for them.
     moved = False
+    funding = None          # the loan the loop has grown (issue 41); None while it is buying_power's own
     if not ctx["costs_follow_size"]:
         with warnings.catch_warnings(record=True):
             warnings.simplefilter("always")
-            sizes, ledger, fast = ctx["size"], ledger_of(pf), None
+            sizes, ledger, fast, loan = ctx["size"], ledger_of(pf), None, pf.margin_loan
             for _ in range(limit):
                 equity = _basis(ledger, "equity")
                 basis = None if risk_of == "init_cash" else (equity if risk_of == "equity" else _basis(ledger, risk_of))
-                ceilings = _cash_ceilings(ledger, sizes, placed, equity, kept) if partial else None
+                unfunded, owed = _unfunded(ledger, equity, sizes, ctx, longs, leverage, loan)
+                ceilings = _cash_ceilings(ledger, sizes, placed, equity, kept, unfunded) if partial else None
                 following = ctx["resize"](basis, equity, ceilings)
-                if _same_sizes(following, sizes, placed):
+                if _same_sizes(following, sizes, placed) and not unfunded.any():
                     break
                 if ceilings is not None:
                     current = _current_ceilings(ceilings, following, sizes, placed, ledger)
@@ -790,38 +816,171 @@ def _settle(prepared, simulated, risk_of, order_bars, partial, charged=None):
                 fast = fast or fast_runner(call, pf, ctx["size"], charged=charged, universe=ctx["universe"])
                 if fast is None:
                     break                   # not covered, or did not reproduce the first run: as before
+                grown = _grown_loan(loan, owed, _loan_needed(ledger, equity, following, ctx, longs, leverage)[0])
+                if grown is not None:
+                    loan = funding = grown
                 sizes, moved = following, True
-                ledger = fast["ledger"](fast["simulate"](sizes))
+                ledger = fast["ledger"](fast["simulate"](sizes, loan=funding))
             else:
                 raise unsettled()
     if moved:
         # The run the fast passes settled on, prepared and simulated as the loop below would, from
-        # the last pass's account: the loop then finds it settled at once, with its own words.
+        # the last pass's account and on its loan: the loop then finds it settled at once, with its
+        # own words.
         ctx, sizing_said = recorded(prepared, basis, equity, ceilings)
-        pf, simulation_said = recorded(simulated, ctx)
+        pf, simulation_said = recorded(simulated, ctx, funding)
+    else:
+        funding = None              # the loop below starts again from the first run, on its loan
 
     for _ in range(limit):
         ledger = ledger_of(pf)
         equity = _basis(ledger, "equity")
         basis = None if risk_of == "init_cash" else (equity if risk_of == "equity" else _basis(ledger, risk_of))
-        ceilings = _cash_ceilings(ledger, ctx["size"], placed, equity, kept) if partial else None
+        unfunded, owed = _unfunded(ledger, equity, ctx["size"], ctx, longs, leverage, pf.margin_loan)
+        ceilings = _cash_ceilings(ledger, ctx["size"], placed, equity, kept, unfunded) if partial else None
         # Read from `pf`'s own account: when the sizes are settled, these are the words about it.
         following, sizing_said = recorded(prepared, basis, equity, ceilings)
-        if _same_sizes(following["size"], ctx["size"], placed):
+        if _same_sizes(following["size"], ctx["size"], placed) and not unfunded.any():
             break
         if ceilings is not None:
             current = _current_ceilings(ceilings, following["size"], ctx["size"], placed, ledger)
             if not np.array_equal(np.isnan(current.to_numpy()), np.isnan(ceilings.to_numpy())):
                 # Some entries after the first change are asked afresh instead (see above).
                 following, sizing_said = recorded(prepared, basis, equity, current)
+        grown = _grown_loan(pf.margin_loan, owed,
+                            _loan_needed(ledger, equity, following["size"], following, longs, leverage)[0])
+        if grown is not None:
+            funding = grown
         ctx = following
-        pf, simulation_said = recorded(simulated, ctx)
+        pf, simulation_said = recorded(simulated, ctx, funding)
     else:  # pragma: no cover - impossible by the argument above
         raise unsettled()
 
     for item in sizing_said + simulation_said:
         warnings.warn_explicit(item.message, item.category, item.filename, item.lineno)
     return pf
+
+
+def _engine_accounts(ledger):
+    """What vectorbt's kernel sees of each account at each signal bar, as `_basis` puts them (row `t` is bar
+    `t - 1`'s close, the last known when an order filling at bar `t`'s open is sent; row 0 the start).
+
+    Returns `(cash, gross, held, accounts)`: each account's cash in the kernel with the margin loan taken out,
+    and its equity before holding costs (both `(n, accounts)`); each column's position (`(n, m)`); and the
+    account of each column (`(m,)`: itself, or its shared account). ⚠️ The kernel never sees the holding costs:
+    they are charged after the simulation, so its cash is what the orders alone have left.
+    """
+    records = ledger["records"]
+    n, m = len(ledger["index"]), len(ledger["columns"])
+    # vectorbt's cash flow of an order: a buy pays its value and fees, a sell receives its value less fees.
+    flow = np.zeros((n, m))
+    sign = np.where(records["side"] == 0, -1.0, 1.0)
+    np.add.at(flow, (records["idx"], records["col"]),
+              sign * records["size"] * records["price"] - records["fees"])
+    assets = np.asarray(ledger["assets"], dtype=float)
+    close = np.asarray(ledger["close"], dtype=float)
+    worth = np.where(assets != 0, assets * close, 0.0)
+    accounts = np.asarray(ledger["groups"]) if ledger["shared"] else np.arange(m)
+    start = np.asarray(ledger["start"], dtype=float)
+    cash = np.zeros((n, len(start)))
+    value = np.zeros((n, len(start)))
+    for k in range(m):
+        cash[:, accounts[k]] += flow[:, k]
+        value[:, accounts[k]] += worth[:, k]
+    cash = start[None, :] + np.cumsum(cash, axis=0)
+    gross = cash + value
+
+    def shifted(array, first):
+        out = np.empty_like(array)
+        out[0] = first
+        out[1:] = array[:-1]
+        return out
+
+    return shifted(cash, start), shifted(gross, start), shifted(assets, 0.0), accounts
+
+
+def _loan_needed(ledger, equity, sizes, ctx, longs, leverage):
+    """The margin loan each account needs for vectorbt's kernel to pay for these long entries on this run's
+    account, at most the broker's rule: `(per account, per entry)`, NaN where no entry needs one.
+
+    OpenStrategy Studio issue 41. A levered account's kernel cash is the account plus a loan, and the loan
+    was fixed at `init_cash x (leverage - 1)`, so an account that had grown could not pay for what its
+    leverage allows. An entry of cost C (its value, spread and commission, as `cap_core` allows for them)
+    on an account whose kernel cash is K needs a loan of C - K. The broker's rule caps it at `leverage x`
+    the equity at the signal bar less what is already open, which in loan terms is `leverage x equity -
+    gross equity` (the kernel holds the open positions at their value). In a separate account the entry is
+    inside its leverage limit already (`cap_core`), so the first is the smaller; in a shared account the
+    second keeps the whole account within `leverage x` its equity at that entry.
+
+    An entry counts where it opened a position in this run, or where its column was flat at the signal bar
+    (cut to nothing, or skipped under `when_cash_short="skip"`); an entry signal while a position is held
+    opens nothing. Only a levered column's entries: an unlevered account's cash is the account.
+    """
+    from .prepare import cap_arrays
+
+    columns, index = ledger["columns"], ledger["index"]
+    n, m = len(index), len(columns)
+    size = np.abs(pd.DataFrame(sizes).reindex(index=index, columns=columns).to_numpy(dtype=float))
+    px, slip, fees, fixed = cap_arrays(ctx["fill_price"], index, columns, ctx["order_kwargs"], (n, m))
+    cash, gross, held, accounts = _engine_accounts(ledger)
+    worth = pd.DataFrame(equity).to_numpy(dtype=float)
+    opened = _opened_sizes(ledger)
+    with np.errstate(invalid="ignore"):
+        cost = size * px * (1.0 + slip) * (1.0 + fees) + fixed
+        entering = (longs & np.isfinite(cost) & (size > 0) & (np.isfinite(opened) | (held == 0))
+                    & (leverage > 1.0)[None, :])
+        # A millionth of the cost to spare, for the kernel's own rounding.
+        asked = cost * (1.0 + 1e-6) - cash[:, accounts]
+        broker = leverage[None, :] * worth - gross[:, accounts]
+        need = np.where(entering, np.minimum(asked, broker), np.nan)
+    per_account = np.full(len(ledger["start"]), np.nan)
+    for k in range(m):
+        column = need[:, k]
+        if np.isfinite(column).any():
+            here = float(np.nanmax(column))
+            a = accounts[k]
+            per_account[a] = here if np.isnan(per_account[a]) else max(per_account[a], here)
+    return per_account, need
+
+
+def _unfunded(ledger, equity, sizes, ctx, longs, leverage, loan):
+    """The entries this run's loan did not pay for, and what loan each account needs for its entries.
+
+    `(unfunded, owed)`: a boolean `(n, m)` array of the entries whose cost was more than the kernel's cash
+    and loan (cut, or skipped, by vectorbt), and `_loan_needed`'s per-account loan. Such an entry is not a
+    ceiling (`_cash_ceilings`): more loan pays for it (OpenStrategy Studio issue 41). An entry cut where the
+    loan was enough was cut by the broker's rule (a shared account's other positions), and is one.
+    """
+    owed, need = _loan_needed(ledger, equity, sizes, ctx, longs, leverage)
+    if loan is None:
+        return np.zeros(need.shape, dtype=bool), owed
+    accounts = np.asarray(ledger["groups"]) if ledger["shared"] else np.arange(need.shape[1])
+    lent = _per_account(loan, len(ledger["start"]))[accounts]
+    with np.errstate(invalid="ignore"):
+        unfunded = np.isfinite(need) & (need > lent[None, :] + 1e-9 * np.maximum(1.0, np.abs(lent))[None, :])
+    return unfunded, owed
+
+
+def _per_account(loan, count) -> np.ndarray:
+    """A loan in `buying_power`'s basis (per column, or one for a shared account) as one per account."""
+    loan = np.atleast_1d(np.asarray(loan, dtype=float))
+    return np.broadcast_to(loan, (count,)).copy() if loan.size == 1 else loan.copy()
+
+
+def _grown_loan(loan, *owed):
+    """The loan the next run needs: `loan`, raised to what any account owes, in `loan`'s basis; None when it
+    is enough already, so a run the loan pays for is simulated on `buying_power`'s own, exactly as before."""
+    if loan is None:
+        return None
+    lent = np.atleast_1d(np.asarray(loan, dtype=float))
+    wanted = lent.copy()
+    for each in owed:
+        each = np.asarray(each, dtype=float)
+        if lent.size == 1 and each.size > 1:
+            each = np.array([np.nanmax(each) if np.isfinite(each).any() else np.nan])
+        wanted = np.where(np.isfinite(each), np.maximum(wanted, each), wanted)
+    grew = wanted > lent + 1e-9 * np.maximum(1.0, np.abs(lent))
+    return wanted if grew.any() else None
 
 
 def _opened_sizes(ledger) -> np.ndarray:
@@ -855,7 +1014,7 @@ def _opened_sizes_nb(order, cols, idxs, sizes, sides, n, m):
     return out
 
 
-def _cash_ceilings(ledger, asked, placed, equity, kept) -> pd.DataFrame:
+def _cash_ceilings(ledger, asked, placed, equity, kept, unfunded=None) -> pd.DataFrame:
     """The most each entry may be asked for on the next run, as this run found it funded.
 
     An entry that opened less than it asked was cut by vectorbt to the cash, off the size step:
@@ -864,11 +1023,17 @@ def _cash_ceilings(ledger, asked, placed, equity, kept) -> pd.DataFrame:
     entry then sees the same account; when the account before it has changed, it is asked
     afresh. `kept` carries the ceilings from run to run: {(bar, column): (ceiling, equity)}.
     `ledger`: the run's account (`_ledger`, or a fast pass's, `replay.ledger_of_records`).
+
+    `unfunded`: the entries this run's margin loan did not pay for (`_unfunded`). They are never
+    ceilings, and one kept from an earlier run is dropped: the next run's loan pays for them
+    (OpenStrategy Studio issue 41). ⚠️ Before, every levered entry cut by its fixed loan became a
+    ceiling, so a grown account kept trading what the starting loan could fund.
     """
     opened = _opened_sizes(ledger)
     wanted = np.abs(pd.DataFrame(asked).to_numpy(dtype=float))
     account = pd.DataFrame(equity).to_numpy(dtype=float)
     out = np.full(wanted.shape, np.nan)
+    owed = np.zeros(wanted.shape, dtype=bool) if unfunded is None else np.asarray(unfunded, dtype=bool)
     if kept:
         # Which kept ceilings still see the same account, all at once (the test is np.isclose's).
         cells = np.array(list(kept), dtype=np.int64).reshape(-1, 2)
@@ -876,12 +1041,13 @@ def _cash_ceilings(ledger, asked, placed, equity, kept) -> pd.DataFrame:
         seen = np.array([value[1] for value in kept.values()], dtype=float)
         same = np.isclose(account[cells[:, 0], cells[:, 1]], seen, rtol=1e-12, atol=0.0)
         for (i, k), roof, keep in zip(list(kept), roofs, same):
-            if keep:
+            if keep and not owed[i, k]:
                 out[i, k] = roof
             else:
                 del kept[(i, k)]
     with np.errstate(invalid="ignore"):
-        cut = placed & np.isfinite(opened) & np.isfinite(wanted) & (opened < wanted * (1.0 - 1e-9))
+        cut = (placed & ~owed & np.isfinite(opened) & np.isfinite(wanted)
+               & (opened < wanted * (1.0 - 1e-9)))
     for i, k in zip(*np.nonzero(cut)):
         out[i, k] = opened[i, k] if np.isnan(out[i, k]) else min(out[i, k], opened[i, k])
         kept[(int(i), int(k))] = (out[i, k], account[i, k])

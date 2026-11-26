@@ -7,6 +7,26 @@ The two optional parts of OpenStrategy Studio issues 23 and 26, and the leverage
 
 ### Fixed
 
+- ⚠️ **Changes results. A levered account's margin loan grows with the account** (OpenStrategy
+  Studio issue 41). The engine was handed `init_cash x leverage` as its cash, a loan of
+  `init_cash x (leverage - 1)` fixed for the whole run, and vectorbt bounds every long by its
+  cash, so an account that had grown could hold at most itself plus that loan: below its
+  leverage limit, cut to the cash with no warning (or not placed, under
+  `when_cash_short="skip"`), and the cut kept as the entry's ceiling. A 10x spread bet sized at
+  19% risk over a 3.25% stop (6x) fell to 1.75x by the time its account had grown thirtyfold,
+  and returned 29.4 times its cash instead of 71.3. The kernel's cash also never saw the
+  holding costs, charged after the simulation. Now the re-sizing loop raises the loan when an
+  entry asks for more than the account and its loan can pay for, up to the broker's rule
+  (`leverage x` the equity at the signal bar, less what is open in a shared account), and
+  simulates again; such an entry is no longer a ceiling. The leverage limit, measured on the
+  equity after holding costs, is what binds. A run its starting loan pays for is simulated on
+  that loan, exactly as before, and an unlevered account has none. Nothing reported moves with
+  the loan (cash, value, borrowing and holding costs net it out). The loop's fast passes replay
+  the kernel with the new loan's cash (`replay.replay(init_cash=)`). Results change for every
+  levered rule strategy whose account outgrew its starting loan: bigger positions, returns and
+  drawdowns. ⚠️ The loan is one number for a run, so a shared account is held to `leverage x`
+  the equity of the entry that needs most, which after a fall from there is looser than a broker
+  (each symbol's own limit still binds). `Portfolio.from_holding_costs` keeps the fixed loan.
 - **A share of an account at or below zero is no order** (OpenStrategy Studio issue 40).
   `risk_pct` or `notional_pct` of a balance below zero was a negative size. The leverage
   cap, measured on the equity, left it as it was whenever the equity was above zero (an open

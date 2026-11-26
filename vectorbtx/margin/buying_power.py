@@ -33,6 +33,14 @@ Two things this buys beyond correct sizing:
   entries (`frontend.prepare.cap_to_leverage`), never as vectorbt's `max_size`, which cuts
   every order, the ones that close a position included (OpenStrategy Studio issue 32).
 
+**The loan grows with the account** (OpenStrategy Studio issue 41). The split below is the
+loan a run *starts* from, `E x (L - 1)` on the starting equity. vectorbt's cash is fixed once
+the run starts, so a loan fixed here left an account that had grown able to hold only itself
+plus that loan: a 10x account worth 30 times its start traded at 1.75x. The front door's
+re-sizing loop (`frontend.backtest._settle`) raises the loan when an entry asks for more than
+the account and its loan can pay for, up to the broker's rule, and simulates again; the
+reported equity is unchanged by it. A portfolio built here by hand keeps the fixed loan.
+
 **What is still not modelled** (unchanged by this, and deferred by D2): maintenance
 margin, margin calls, and forced liquidation. A position can draw the whole loan and sit
 there. `min_margin_level` reports how close it came.

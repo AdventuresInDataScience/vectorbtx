@@ -216,6 +216,11 @@ Reported cash therefore goes negative by exactly the drawn loan, and
 `returns_stats`, every metric — derives from those two, so it all follows without touching
 the engine.
 
+The loan above is where a run starts. Through the front door it grows with the account: when an
+entry asks for more than the account and its loan can pay for, the loan is raised to pay for it
+(up to `leverage ×` the equity at the signal bar, less what is open in a shared account) and the
+run is simulated again, so an account that has grown trades what its leverage allows.
+
 ```python
 pf.margin_loan               # buying power beyond your own equity
 pf.cash().iloc[-1]           # negative when the loan is drawn

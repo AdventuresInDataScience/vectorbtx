@@ -1735,15 +1735,21 @@ def test_a_cut_entry_allows_for_the_spread_so_it_stays_on_the_size_step():
 
 
 def test_an_entry_cut_to_the_cash_is_asked_again_on_the_size_step():
-    """A 2x account's loan is fixed at the start, so after a gain its cash is short of the leverage limit:
-    200 shares at 100 sold at 125 leave equity 15,000 (a limit of 30,000) but cash of 25,000. A
-    whole-account entry at 107 asks 280 shares; vectorbt cut it to the cash, 233.64, off the step. It
-    is asked again at what was funded, rounded down: 233 shares."""
-    o, h, l, c = frames([100, 100, 110, 125, 110, 107, 107, 107])
-    pf = run(o, h, l, c, instruments={"X": dict(EQUITY, leverage=2.0)},
-             entries=mask(c.index, ["X"], [("X", 0), ("X", 4)]), exits=mask(c.index, ["X"], [("X", 2)]),
-             notional_pct=2.0, risk_of="equity", init_cash=10_000)
-    assert _sized_orders(pf) == [(1, "Buy", 200.0), (3, "Sell", 200.0), (5, "Buy", 233.0)]
+    """A shared account's cash is spoken for: X holds 6,000 of a 10,000 account at 1x, so a whole-account
+    entry in Y at 107 (93 shares, inside 1x of the equity) is cut by vectorbt to the 4,000 left, 37.38
+    shares, off the step. It is asked again at what was funded, rounded down: 37 shares.
+
+    (Until issue 41 this test was a 2x account whose loan was fixed at the start, so a grown account was
+    cut to the cash below its leverage limit; that account now trades its limit,
+    `test_a_grown_levered_account_trades_its_leverage`.)"""
+    o, h, l, c = frames([100.0] * 8, columns=("X", "Y"))
+    for frame in (o, h, l, c):
+        frame["Y"] = frame["Y"] + 7.0
+    pf = run(o, h, l, c, instruments={"X": EQUITY, "Y": EQUITY}, cash="shared", when_cash_short="partial",
+             entries=mask(c.index, ["X", "Y"], [("X", 0), ("Y", 2)]), exits=mask(c.index, ["X", "Y"]),
+             notional_pct=[0.6, 1.0], risk_of="equity", init_cash=10_000)
+    records = pf.orders.records_readable
+    assert list(zip(records["Column"], records["Size"])) == [("X", 60.0), ("Y", 37.0)]
 
 
 def test_nothing_binding_is_simulated_once(monkeypatch):
@@ -1807,10 +1813,11 @@ def test_a_run_that_settles_at_once_keeps_its_warnings():
 # ############# 36. Entries cut to the cash settle, one run each ############# #
 
 
-def _cut_to_the_cash():
+def _outgrows_its_loan():
     """A 5x spread bet that wins every trade (1% a bar), six round trips, each entry worth 4.8 times the
-    equity at its signal bar: inside 5x, but a levered account's loan is fixed at the start (40,000), so
-    once the equity passes about 11,400 each entry is more than cash and loan can pay for."""
+    equity at its signal bar: inside 5x. Until issue 41 a levered account's loan was fixed at the start
+    (40,000), so once the equity passed about 11,400 each entry was more than cash and loan could pay
+    for, and vectorbt cut it to the cash."""
     opens = [100.0 * 1.01 ** k for k in range(35)]
     o, h, l, c = frames(opens)
     instrument = {"mode": "spreadbet", "point_size": 1.0, "quote_currency": "USD", "spread_points": 0.0,
@@ -1821,10 +1828,33 @@ def _cut_to_the_cash():
                notional_pct=4.8, risk_of="equity", init_cash=10_000)
 
 
+def _cut_to_the_cash():
+    """A shared account at 1x whose cash is spoken for: X holds 6,000 of it (60 shares at a flat 100) from
+    the first bar, and Y, rising 1% a bar, makes six round trips, each entry worth the whole equity at its
+    signal bar. Each Y entry is inside 1x of the equity but more than the cash X leaves, so vectorbt cuts
+    every one to the cash, off the size step, and each win moves the account the next one sees."""
+    rises = [100.0 * 1.01 ** k for k in range(35)]
+    o, h, l, c = frames(rises, columns=("X", "Y"))
+    for frame, flat in ((o, 100.0), (h, 100.5), (l, 99.5), (c, 100.0)):
+        frame["X"] = flat
+    pf = run(o, h, l, c, instruments={"X": EQUITY, "Y": EQUITY}, cash="shared", when_cash_short="partial",
+             entries=mask(c.index, ["X", "Y"], [("X", 0)] + [("Y", bar) for bar in range(2, 30, 5)]),
+             exits=mask(c.index, ["X", "Y"], [("Y", bar) for bar in range(5, 31, 5)]),
+             notional_pct=[0.6, 1.0], risk_of="equity", init_cash=10_000)
+    # By hand: each Y entry fills at the next open and is cut to the cash, rounded down to a whole share;
+    # its exit fills three bars later.
+    equity, buys = 10_000.0, []
+    for entry in range(3, 30, 5):
+        size = float(np.floor((equity - 6_000.0) / rises[entry]))
+        buys.append(size)
+        equity += size * (rises[entry + 3] - rises[entry])
+    return pf, buys, equity
+
+
 def test_entries_cut_to_the_cash_settle_one_run_each(monkeypatch):
     """Issue 36: each entry cut to the cash took two runs (asked afresh and cut, then asked at that ceiling,
-    whose account had moved by then), against a limit of one per entry bar, so this raised RuntimeError
-    after 8 runs. The sizes are the ones the old loop reaches given as many runs as it needs."""
+    whose account had moved by then), against a limit of one per entry bar, so a run like this raised
+    RuntimeError. Each Y entry settles on what the cash funds, on the size step."""
     import vectorbtx.core.portfolio as module
 
     calls = []
@@ -1835,11 +1865,12 @@ def test_entries_cut_to_the_cash_settle_one_run_each(monkeypatch):
         return original(cls, *args, **kwargs)
 
     monkeypatch.setattr(module.Portfolio, "from_signals", classmethod(counted))
-    pf = _cut_to_the_cash()
-    buys = [size for _, side, size in _sized_orders(pf) if side == "Buy"]
-    assert buys == [475.0, 484.0, 475.0, 465.0, 456.0, 447.0]          # whole stakes, on the size step
-    assert len(_sized_orders(pf)) == 12 and _held_at_end(pf) == 0.0
-    assert len(calls) <= 6 + 2, len(calls)                                # the old loop took 11
+    pf, buys, equity = _cut_to_the_cash()
+    records = pf.orders.records_readable
+    bought = records[(records["Column"] == "Y") & (records["Side"] == "Buy")]["Size"].tolist()
+    assert bought == buys and len(records) == 13
+    assert float(np.asarray(pf.value()).ravel()[-1]) == pytest.approx(equity)
+    assert len(calls) <= 7 + 2, len(calls)
 
 
 def test_a_run_that_cannot_settle_raises_a_backtest_error(monkeypatch):
@@ -1850,7 +1881,7 @@ def test_a_run_that_cannot_settle_raises_a_backtest_error(monkeypatch):
 
     monkeypatch.setattr(module, "_same_sizes", lambda new, old, placed: False)
     with pytest.raises(BacktestError, match="did not settle after 14 runs"):           # 2 x 6 entry bars + 2
-        _cut_to_the_cash()
+        _outgrows_its_loan()
 
 
 # ############# 37. The re-sizing loop's passes, made on arrays ############# #
@@ -1868,7 +1899,7 @@ def _passes(name):
     entries = mask(c.index, ["X"], [("X", bar) for bar in range(0, 200, 5)])
     exits = mask(c.index, ["X"], [("X", bar) for bar in range(3, 200, 5)])
     common = dict(o=o, h=h, l=l, c=c, instruments={"X": bet}, entries=entries, exits=exits, init_cash=10_000)
-    if name == "cut to the cash":
+    if name == "outgrows its starting loan":
         return dict(common, notional_pct=4.8, risk_of="equity")
     if name == "a share of the balance, a stop in %":
         return dict(common, risk_pct=0.2, risk_of="balance", sl_stop=0.05)
@@ -1885,6 +1916,15 @@ def _passes(name):
         none = mask(c.index, ["X"])
         return dict(common, o=o, h=h, l=l, c=c, entries=none, exits=none, short_entries=entries,
                     short_exits=exits, notional_pct=4.8, risk_of="equity")
+    if name == "cut to the cash in a shared account":
+        # X holds 6,000 of a 1x account; each Y entry, the whole equity, is cut to the cash X leaves.
+        o, h, l, c = frames(rises, columns=("X", "Y"))
+        for frame, flat in ((o, 100.0), (h, 100.5), (l, 99.5), (c, 100.0)):
+            frame["X"] = flat
+        return dict(common, o=o, h=h, l=l, c=c, instruments={"X": EQUITY, "Y": EQUITY},
+                    entries=mask(c.index, ["X", "Y"], [("X", 0)] + [("Y", bar) for bar in range(2, 200, 5)]),
+                    exits=mask(c.index, ["X", "Y"], [("Y", bar) for bar in range(5, 200, 5)]),
+                    notional_pct=[0.6, 1.0], risk_of="equity", cash="shared", when_cash_short="partial")
     if name == "shared cash":
         o, h, l, c = frames(rises, columns=("X", "Y"))
         both = [(col, bar) for col in ("X", "Y") for bar in range(0, 200, 5)]
@@ -1895,8 +1935,9 @@ def _passes(name):
     raise KeyError(name)
 
 
-_PASSES = ["cut to the cash", "a share of the balance, a stop in %", "a trailing stop in points", "holding costs",
-           "skip when cash is short", "shorts in a falling market", "shared cash"]
+_PASSES = ["outgrows its starting loan", "a share of the balance, a stop in %", "a trailing stop in points", "holding costs",
+           "skip when cash is short", "shorts in a falling market", "shared cash",
+           "cut to the cash in a shared account"]
 
 
 def _orders_of(pf):
@@ -1933,10 +1974,11 @@ def test_the_fast_passes_give_the_loops_own_result(name, monkeypatch):
     assert fast_said == slow_said
 
 
-def test_a_run_cut_to_the_cash_builds_the_whole_run_twice(monkeypatch):
+def test_a_run_that_grows_builds_the_whole_run_twice(monkeypatch):
     """Issue 37: forty entries cut to the cash took 41 whole runs (each prepared twice and built into a
     Portfolio, about 30 ms around a 1 ms simulation). Now the first run and the one it settles on are built;
-    the passes between are the kernel alone."""
+    the passes between are the kernel alone. (Since issue 41 the entries are no longer cut: the loop grows
+    the loan instead, in passes of its own, and sizes each from the equity it reaches.)"""
     import vectorbtx.core.portfolio as module
     import vectorbtx.frontend.replay as replay
 
@@ -1950,9 +1992,9 @@ def test_a_run_cut_to_the_cash_builds_the_whole_run_twice(monkeypatch):
 
     monkeypatch.setattr(module.Portfolio, "from_signals", classmethod(counted))
     monkeypatch.setattr(replay, "replay", lambda *args: replayed.append(1) or real_replay(*args))
-    pf = run(**{k: v for k, v in _passes("cut to the cash").items()})
+    pf = run(**{k: v for k, v in _passes("outgrows its starting loan").items()})
     assert len(built) == 2, len(built)
-    assert len(replayed) >= 30, len(replayed)                    # one pass per entry cut, as before
+    assert len(replayed) >= 10, len(replayed)                    # many passes, each the kernel alone
     assert _held_at_end(pf) == 0.0 and len(_sized_orders(pf)) == 80
 
 
@@ -1963,7 +2005,7 @@ def test_costs_that_follow_the_size_keep_the_loop_as_it_was(monkeypatch):
 
     called = []
     monkeypatch.setattr(replay, "fast_runner", lambda *args, **kwargs: called.append(1))
-    kwargs = dict(_passes("cut to the cash"), notional_pct=0.9)
+    kwargs = dict(_passes("outgrows its starting loan"), notional_pct=0.9)
     # Unlevered: levered and cut to the cash, a minimum commission does not settle (issue 38, open).
     kwargs["instruments"] = {"X": dict(EQUITY, commission_pct=0.001, commission_min=1.0)}
     pf = run(**kwargs)
@@ -2046,3 +2088,110 @@ def test_an_account_above_zero_is_sized_as_before():
     keep = {"share": "notional_pct", "shares": np.full((3, 2), 2.0), "prices": np.full((3, 2), 100.0)}
     assert np.array_equal(size_from_basis(keep, money, None),
                           np.array([[200.0, np.nan], [np.nan, np.nan], [5.01, 0.02]]), equal_nan=True)
+
+
+# ############# 41. A levered account's loan grows with the account ############# #
+
+
+def test_a_grown_levered_account_trades_its_leverage():
+    """Issue 41: a 2x account's loan was fixed at the start (10,000), so after a gain its cash was short of
+    its leverage limit: 200 shares at 100 sold at 125 leave equity 15,000 (a limit of 30,000) but cash and
+    loan of 25,000, so a whole-account entry at 107, 280 shares, was cut to 233 (or not placed, under
+    `when_cash_short="skip"`). Now the loop grows the loan to pay for it, and what is reported is the
+    account's, whatever the loan."""
+    o, h, l, c = frames([100, 100, 110, 125, 110, 107, 107, 107])
+    for short in ("partial", "skip"):
+        pf = run(o, h, l, c, instruments={"X": dict(EQUITY, leverage=2.0)},
+                 entries=mask(c.index, ["X"], [("X", 0), ("X", 4)]), exits=mask(c.index, ["X"], [("X", 2)]),
+                 notional_pct=2.0, risk_of="equity", init_cash=10_000, when_cash_short=short)
+        assert _sized_orders(pf) == [(1, "Buy", 200.0), (3, "Sell", 200.0), (5, "Buy", 280.0)], short
+        assert float(np.asarray(pf.get_init_cash()).ravel()[0]) == pytest.approx(10_000.0)
+        assert float(np.asarray(pf.value()).ravel()[-1]) == pytest.approx(15_000.0)
+        assert float(np.asarray(pf.margin_loan).ravel()[0]) > 10_000.0
+
+
+def test_entries_grow_with_the_account_past_the_starting_loan():
+    """Issue 41: a 5x spread bet, each entry worth 4.8 times the equity at its signal bar, wins six trades in a
+    row. Each entry is what that equity allows, worked out here by hand, where the loan fixed at 40,000 cut
+    them to 484, 475, 465, 456 and 447 a point while the account grew."""
+    pf = _outgrows_its_loan()
+    opens = [100.0 * 1.01 ** k for k in range(35)]
+    equity, buys = 10_000.0, []
+    for entry in range(1, 30, 5):
+        size = float(np.floor(4.8 * equity / opens[entry]))
+        buys.append(size)
+        equity += size * (opens[entry + 3] - opens[entry])
+    assert buys == [475.0, 517.0, 564.0, 614.0, 670.0, 730.0]
+    assert [size for _, side, size in _sized_orders(pf) if side == "Buy"] == buys
+    assert float(np.asarray(pf.value()).ravel()[-1]) == pytest.approx(equity)
+    assert _held_at_end(pf) == 0.0
+
+
+def test_a_run_its_starting_loan_pays_for_is_funded_as_before(monkeypatch):
+    """The loan grows only when an entry needs more: a stake far inside it keeps `init_cash x (leverage - 1)`,
+    and the run is simulated once, as before issue 41. An unlevered account never has a loan."""
+    import vectorbtx.core.portfolio as module
+
+    calls = []
+    original = module.Portfolio.from_signals.__func__
+
+    def counted(cls, *args, **kwargs):
+        calls.append(1)
+        return original(cls, *args, **kwargs)
+
+    monkeypatch.setattr(module.Portfolio, "from_signals", classmethod(counted))
+    opens = [100.0 * 1.01 ** k for k in range(35)]
+    o, h, l, c = frames(opens)
+    bet = {"mode": "spreadbet", "point_size": 1.0, "quote_currency": "USD", "spread_points": 0.0,
+           "leverage": 5.0, "min_size": 1.0, "increment": 1.0}
+    signals = dict(entries=mask(c.index, ["X"], [("X", bar) for bar in range(0, 30, 5)]),
+                   exits=mask(c.index, ["X"], [("X", bar) for bar in range(3, 30, 5)]))
+    pf = run(o, h, l, c, instruments={"X": bet}, stake=10.0, init_cash=10_000, **signals)
+    assert len(calls) == 1 and float(np.asarray(pf.margin_loan).ravel()[0]) == 40_000.0
+    calls.clear()
+    pf = run(o, h, l, c, instruments={"X": EQUITY}, notional_pct=1.0, risk_of="equity", init_cash=10_000, **signals)
+    assert not np.asarray(pf.margin_loan).any()
+    assert len([size for _, side, size in _sized_orders(pf) if side == "Buy"]) == 6
+
+
+def test_a_shared_account_is_funded_to_its_leverage_on_its_equity():
+    """Issue 41 in a shared 2x account, where the broker's rule is on the whole account: every position
+    together worth at most 2x the equity. Y doubles 10,000 to 20,000 at 2x and sells at 125 (equity
+    15,000); X then buys 225 shares at 100 (22,500, 1.5x). Y asks 2x the equity again, 300 shares at 100,
+    which its own limit allows, but the account has 30,000 - 22,500 = 7,500 left: 75 shares. The fixed loan
+    left vectorbt 2,500, so 25 shares; a loan grown to pay for all 300 would have held 2.5x."""
+    o, h, l, c = frames([100.0] * 10, columns=("X", "Y"))
+    for frame in (o, h, l, c):
+        frame["Y"] = [100.0, 100.0, 110.0, 125.0, 125.0, 110.0, 100.0, 100.0, 100.0, 100.0]
+    lever = dict(EQUITY, leverage=2.0)
+    pf = run(o, h, l, c, instruments={"X": lever, "Y": lever}, cash="shared", when_cash_short="partial",
+             entries=mask(c.index, ["X", "Y"], [("Y", 0), ("X", 4), ("Y", 6)]),
+             exits=mask(c.index, ["X", "Y"], [("Y", 2)]), notional_pct=[1.5, 2.0], risk_of="equity",
+             init_cash=10_000)
+    records = pf.orders.records_readable
+    index = pf.wrapper.index
+    orders = [(str(col), int(index.get_loc(t)), side, float(size))
+              for col, t, side, size in zip(records["Column"], records["Timestamp"], records["Side"], records["Size"])]
+    assert orders == [("Y", 1, "Buy", 200.0), ("Y", 3, "Sell", 200.0), ("X", 5, "Buy", 225.0), ("Y", 7, "Buy", 75.0)]
+    held = np.asarray(pf.asset_value(group_by=False))[-1].sum()
+    assert held == pytest.approx(2 * float(np.asarray(pf.value()).ravel()[-1]))        # exactly 2x, not more
+
+
+def test_a_grown_account_is_limited_on_its_equity_after_holding_costs():
+    """The kernel's cash never sees the holding costs (they are charged after the simulation), so it cannot
+    say what the account has left; the leverage limit does, measured on the equity they are taken from.
+    Each entry of a 5x spread bet paying 5% financing is 4.8 times that equity at its signal bar, on the size
+    step, never cut to the cash, as the loan grows past its start."""
+    from vectorbtx.frontend.backtest import account_basis
+
+    kwargs = _passes("holding costs")
+    pf = run(**kwargs)
+    assert pf.holding_costs is not None and float(np.asarray(pf.margin_loan).ravel()[0]) > 40_000.0
+    equity = account_basis(pf, "equity")["X"]
+    opens = kwargs["o"]["X"]
+    records = pf.orders.records_readable
+    buys = records[records["Side"] == "Buy"]
+    assert len(buys) == 40
+    for t, size in zip(buys["Timestamp"], buys["Size"]):
+        assert size == np.floor(4.8 * equity.loc[t] / opens.loc[t]), t
+
