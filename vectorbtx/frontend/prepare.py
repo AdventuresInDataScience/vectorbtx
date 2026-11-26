@@ -1149,6 +1149,7 @@ def prepare(
     # everything else
     spec_kwargs=None,
     passthrough=None,
+    first_bars=None,
 ):
     """Run the whole front-door pipeline and return everything a constructor needs.
 
@@ -1179,6 +1180,10 @@ def prepare(
         ceilings: the most each entry may be, per fill bar and column, in engine units, as
             the front door found it funded on an earlier run (`_cash_ceilings`); NaN for
             none. Rounded down to the size step here.
+        first_bars: `{column: bar}`, the position each column's history starts at, for a
+            `windows=` call (OpenStrategy Studio issue 42): automatic slippage measures its
+            volatility and average volume from there, as a call on that window alone does.
+            None: every column's history starts at the first bar.
 
     Returns:
         dict with `universe`, `strategy`, `columns`, `price`, `fill_price`, `size`,
@@ -1247,6 +1252,7 @@ def prepare(
             ),
             point_fx=point_fx if point_fx is not None else pd.DataFrame(1.0, index=fill.index,
                                                                         columns=columns),
+            first_bars=first_bars,
         )
 
     # Whether any cost depends on the size ordered: a commission per unit or with a minimum, or

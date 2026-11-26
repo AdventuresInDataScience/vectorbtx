@@ -51,6 +51,7 @@ def resolve_universe(
     size=None,
     fx_markup=None,
     point_fx=None,
+    first_bars=None,
     include_costs: bool = True,
     include_quantization: bool = True,
     include_leverage: bool = True,
@@ -74,6 +75,8 @@ def resolve_universe(
             `slippage`. None reads it off `data` when that is a `ConvertedFrame`.
         point_fx: the rate each column was converted at, per bar (`fx_rate_of`), so a
             cost in points is in the account currency. None reads it off `data`.
+        first_bars: `{column: bar}`, where each column's history starts (a `windows=`
+            call, OpenStrategy Studio issue 42), for automatic slippage. None: the first bar.
         include_costs: emit `fees` / `fixed_fees` / `slippage`.
         include_quantization: emit `size_granularity` / `min_size`.
         include_leverage: emit `max_size` (needs `equity`).
@@ -162,6 +165,7 @@ def resolve_universe(
                 rates=rates,
                 fx_markup=fx_markup,
                 point_fx=point_fx,
+                first_bars=first_bars,
             )
         )
 

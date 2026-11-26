@@ -97,6 +97,8 @@ def PortfolioBacktest(
     cash=None,
     entry_priority=None,
     when_cash_short=None,
+    # --- several windows of the history, one portfolio each ---
+    windows=None,
     **kwargs,
 ):
     """Run a backtest from one call and return a `vectorbtx.Portfolio`.
@@ -175,15 +177,30 @@ def PortfolioBacktest(
             equity at its signal bar), or than the cash can cover, does: cut down to what is
             funded, rounded down to the size step, or not placed. Maps to vectorbt's
             `allow_partial` for the cash. An exit always closes the whole position.
+        windows: several windows of the history, each run as its own account from
+            `init_cash`, in one call: a list of `(start, end)` pairs of labels on the index,
+            both inclusive (as `.loc[start:end]`), each inside the index and at least two
+            bars long; they may overlap. Returns a list of portfolios, one per window, in
+            order, each the one this call makes with every per-bar input sliced
+            `.loc[start:end]` (its orders, value, returns, trades and stats), with this
+            call's column names; under `cash="shared"` one shared account per window. The
+            windows share one simulation, so the re-sizing loop's work is paid once rather
+            than once per window. Warnings are said once for the call; one about a window's
+            column names it `"<column> (window k)"`, k counting from 1. Rule strategies
+            only: `weights=`, a buy-and-hold, a raw `cash_sharing=` / `group_by=` /
+            `call_seq=` and a custom `signal_func_nb` raise. See
+            `vectorbtx.frontend.windows`.
         **kwargs: anything else, forwarded to the underlying vectorbt constructor.
 
     Returns:
-        `vectorbtx.Portfolio`.
+        `vectorbtx.Portfolio`; with `windows=`, a list of them, one per window.
 
     Raises:
         BacktestError: on a missing or unknown `mode`, an argument a mode rejects, two
             sizing arguments, both signals and weights, or a passthrough colliding with a
-            resolved cost.
+            resolved cost; with `windows=`, on a window that is not a pair of labels inside
+            the index holding two bars or more, or a strategy or argument windows do not
+            cover.
 
     Notes:
         **Orders fill at the next bar's open, always.** A signal computed from bar `t`'s
@@ -290,8 +307,47 @@ def PortfolioBacktest(
     high = pd.DataFrame(high).reindex(index=close.index, columns=close.columns)
     low = pd.DataFrame(low).reindex(index=close.index, columns=close.columns)
 
-    invalid = ((high < low) | (high < close) | (low > close)).to_numpy().any()
-    if invalid:
+    # Several windows in one simulation (OpenStrategy Studio issue 42): each window becomes a block of
+    # columns of its own, its signals kept to its own bars (`windows.tile`), and the portfolio is cut back
+    # into one per window at the end (`windows.cut`). Everything below then runs on the blocks unchanged,
+    # but for three things done per window: the cash groups and margin loans of a shared account, its call
+    # order, and automatic slippage's history (`blocks`).
+    blocks = None
+    if windows is not None:
+        from .windows import tile
+
+        tiled = tile(
+            windows, close=close, open=open, high=high, low=low, point_fx=point_fx, volume=volume,
+            signals=dict(entries=entries, exits=exits, short_entries=short_entries, short_exits=short_exits),
+            stops=dict(stop_points=stop_points, target_points=target_points, trail_points=trail_points,
+                       stop_price=stop_price, target_price=target_price, trail_price=trail_price),
+            sizing=dict(risk_pct=risk_pct, risk_amount=risk_amount, stake=stake, notional=notional, size=size,
+                        notional_pct=notional_pct),
+            init_cash=init_cash, instruments=instruments, spec_kwargs=spec_kwargs,
+            entry_priority=entry_priority, kwargs=kwargs, passthrough=passthrough,
+            weights=weights, schedule=schedule,
+        )
+        close, open, high, low = tiled["close"], tiled["open"], tiled["high"], tiled["low"]
+        point_fx, volume = tiled["point_fx"], tiled["volume"]
+        entries, exits = tiled["signals"]["entries"], tiled["signals"]["exits"]
+        short_entries, short_exits = tiled["signals"]["short_entries"], tiled["signals"]["short_exits"]
+        stop_points, target_points = tiled["stops"]["stop_points"], tiled["stops"]["target_points"]
+        trail_points, stop_price = tiled["stops"]["trail_points"], tiled["stops"]["stop_price"]
+        target_price, trail_price = tiled["stops"]["target_price"], tiled["stops"]["trail_price"]
+        risk_pct, risk_amount = tiled["sizing"]["risk_pct"], tiled["sizing"]["risk_amount"]
+        stake, notional, size = tiled["sizing"]["stake"], tiled["sizing"]["notional"], tiled["sizing"]["size"]
+        notional_pct = tiled["sizing"]["notional_pct"]
+        init_cash, instruments, entry_priority = tiled["init_cash"], tiled["instruments"], tiled["entry_priority"]
+        kwargs, passthrough = tiled["kwargs"], tiled["passthrough"]
+        spec_kwargs = {}                    # spent: the blocks' Universe holds the instruments' terms
+        blocks = tiled["blocks"]
+
+    invalid = ((high < low) | (high < close) | (low > close)).to_numpy()
+    if blocks is not None:
+        from .windows import inside
+
+        invalid = invalid & inside(blocks)          # each block on its own window's bars only
+    if invalid.any():
         warnings.warn(
             "high/low do not bracket close on every bar (H >= C >= L is violated "
             "somewhere). This usually means the series were adjusted or FX-converted "
@@ -314,6 +370,10 @@ def PortfolioBacktest(
         entry_priority=entry_priority,
         when_cash_short=when_cash_short,
     )
+    if blocks is not None and cash == "shared":
+        # One shared account per window: the blocks are the cash groups (`windows.tile` has refused a raw
+        # `group_by`, so this is the only grouping).
+        sim_kwargs["group_by"] = blocks["groups"]
     risk_of = _check_risk_of(risk_of, risk_pct, notional_pct, init_cash)
 
     # ⚠️ ALL FOUR signal arrays shift, not just the long pair. Short signals used to arrive
@@ -369,6 +429,7 @@ def PortfolioBacktest(
             ceilings=ceilings,
             spec_kwargs=spec_kwargs,
             passthrough=passthrough,
+            first_bars=None if blocks is None else blocks["first_bars"],
         )
 
     def simulated(ctx, loan=None):
@@ -400,9 +461,15 @@ def PortfolioBacktest(
             # for `call_seq="auto"`), so the basis has to be decided here rather than read
             # off whatever the caller happened to pass.
             shares_cash = bool(kw.get("cash_sharing", strategy == "weights"))
-            engine_cash, margin_loan = buying_power(
-                universe, init_cash, ctx["columns"], cash_sharing=shares_cash,
-            )
+            if blocks is not None and shares_cash:
+                # A shared account per window, each with its own starting cash and loan (issue 42).
+                from .windows import buying_power_by_window
+
+                engine_cash, margin_loan = buying_power_by_window(universe, init_cash, ctx["columns"], blocks)
+            else:
+                engine_cash, margin_loan = buying_power(
+                    universe, init_cash, ctx["columns"], cash_sharing=shares_cash,
+                )
             if loan is not None:
                 # The account is the same; only what vectorbt may draw on is more. Nothing
                 # reported moves with it: cash, value, borrowing and holding costs are all read
@@ -514,7 +581,16 @@ def PortfolioBacktest(
                         np.full(n_cols, np.nan),                 # each position's stop so far
                         np.full(n_cols, -1, dtype=np.int64),     # the entry it belongs to
                     )
-            if cash == "shared" and "call_seq" not in kw:
+            if cash == "shared" and "call_seq" not in kw and blocks is not None:
+                # Each window's call order on its own bars and columns, as a call on it alone orders them.
+                from .windows import shared_call_seq_by_window
+
+                kw["call_seq"] = shared_call_seq_by_window(
+                    blocks, price.index, placing,
+                    entry_priority=_next_bar_scores(entry_priority, price),
+                    seed=kw.get("seed"), direction=kw.get("direction"), split_bars=split,
+                )
+            elif cash == "shared" and "call_seq" not in kw:
                 kw["call_seq"] = shared_call_seq(
                     price.index, ctx["columns"], **placing,
                     entry_priority=_next_bar_scores(entry_priority, price),
@@ -602,13 +678,19 @@ def PortfolioBacktest(
 
     sized = any(v is not None for v in (risk_pct, risk_amount, stake, notional, size, notional_pct))
     if strategy != "signals" or not sized or init_cash is None:
-        return simulated(prepared())
-    # Every sized rule strategy settles its entries against the account as the run goes: the
-    # leverage limit against the equity at each signal bar (issue 33), a share of the balance or
-    # equity (`risk_of`), and an entry vectorbt had to cut to the cash re-asked at what was
-    # funded, on the size step (issue 34). A run where none of that binds is simulated once.
-    return _settle(prepared, simulated, risk_of, order_bars, bool(sim_kwargs.get("allow_partial", True)),
-                   charged=charged, longs=sides["long"])
+        pf = simulated(prepared())
+    else:
+        # Every sized rule strategy settles its entries against the account as the run goes: the
+        # leverage limit against the equity at each signal bar (issue 33), a share of the balance or
+        # equity (`risk_of`), and an entry vectorbt had to cut to the cash re-asked at what was
+        # funded, on the size step (issue 34). A run where none of that binds is simulated once.
+        pf = _settle(prepared, simulated, risk_of, order_bars, bool(sim_kwargs.get("allow_partial", True)),
+                     charged=charged, longs=sides["long"])
+    if blocks is not None:
+        from .windows import cut
+
+        return cut(pf, blocks)
+    return pf
 
 
 def _wants_holding_costs(universe, rates) -> bool:

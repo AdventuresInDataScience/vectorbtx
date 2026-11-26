@@ -81,6 +81,28 @@ class Slippage(_Base):
                 f"{ctx.get('column')}: slippage='auto' needs an order size to scale "
                 f"market impact. Pass size=... to resolve_costs."
             )
+        first = int(ctx.get("first_bar") or 0)
+        if first:
+            # ⚠️ A window of a `windows=` call (OpenStrategy Studio issue 42): its history starts here, as a call
+            # on the window alone starts. Measured over the bars before it too, the volatility and average
+            # volume of its first 20 bars would differ from that call's, and so would their orders' slippage.
+            # Before the window the column places no order, so its slippage there is never used.
+            price = pd.Series(np.asarray(price, dtype=float), index=getattr(price, "index", None))
+            sizes = size
+            if np.ndim(size) and len(np.asarray(size)) == len(price):
+                sizes = np.asarray(size, dtype=float)[first:]
+            measured = auto_slippage(
+                price.iloc[first:],
+                None if volume is None else pd.Series(np.asarray(volume, dtype=float)).iloc[first:],
+                sizes,
+                coef=spec.slippage_coef,
+                slippage_max=spec.slippage_max,
+                window=ctx.get("vol_window", 20),
+                adv=spec.adv,
+            )
+            out = pd.Series(0.0, index=price.index)
+            out.iloc[first:] = measured.to_numpy(dtype=float)
+            return {"slippage": out}
         return {
             "slippage": auto_slippage(
                 price,

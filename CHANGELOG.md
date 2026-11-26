@@ -7,6 +7,11 @@ The two optional parts of OpenStrategy Studio issues 23 and 26, and the leverage
 
 ### Fixed
 
+- **Split bars with several cash groups and an array call sequence raised "Call index exceeds
+  bounds of the group".** `simulate_split_bars` filled the rest-of-bar steps of a `call_seq`
+  array with every column's number, which counts past the first group: a call sequence counts
+  within each group. Now each column's offset in its group (`_offsets_in_group`). One shared
+  account (`cash="shared"`, a single group) was unaffected.
 - ⚠️ **Changes results. A levered account's margin loan grows with the account** (OpenStrategy
   Studio issue 41). The engine was handed `init_cash x leverage` as its cash, a loan of
   `init_cash x (leverage - 1)` fixed for the whole run, and vectorbt bounds every long by its
@@ -121,6 +126,25 @@ The two optional parts of OpenStrategy Studio issues 23 and 26, and the leverage
   entry is cut down (or not placed) rather than partially filled.
 
 ### Added
+
+- **`windows=`: several windows of the history, each its own account, in one call**
+  (OpenStrategy Studio issue 42). `PortfolioBacktest(..., windows=[(start, end), ...])`
+  (and `SingleBacktest`) returns a list of portfolios, one per window, each the one the same
+  call makes with every per-bar input sliced `.loc[start:end]`: the same orders (ids
+  included), value, returns, trades and stats, with the call's own column names, and under
+  `cash="shared"` one shared account per window. Windows are labels on the index, both
+  inclusive, at least two bars, and may overlap. Until now each window was a call of its own,
+  and each call paid the re-sizing loop's fixed work again (preparing the run, simulating it,
+  reading the account): about 0.43 s of a 0.47 s call on one fold of a levered, risk-sized
+  daily strategy. Now each window is a block of columns in one simulation, its signals kept
+  to its own bars (so before it the block holds nothing, and after it no entry fills), the
+  loop settles every block at once, and each block is cut back to its window
+  (`vectorbtx.frontend.windows`). A shared account's cash group, margin loan and call order,
+  and automatic slippage's volatility and average volume, are worked out per window, so they
+  match a call on the window alone. A warning about a window's column names it
+  `"<column> (window k)"`. Rule strategies only: `weights=`, a buy-and-hold, a raw
+  `cash_sharing=` / `group_by=` / `call_seq=` and a custom `signal_func_nb` raise
+  `BacktestError`. `tests/test_windows.py` checks every window against its own call.
 
 - **`notional_pct=`: a position worth a share of the account** (issue 23's "the other
   common rule"). `notional_pct=0.5` sizes each position to half the account; above 1 is a

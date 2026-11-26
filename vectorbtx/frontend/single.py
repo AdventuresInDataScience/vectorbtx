@@ -44,10 +44,11 @@ def SingleBacktest(*, close=None, open=None, high=None, low=None, **kwargs):
         open: the matching open series. **Required** — orders fill at the next bar's open.
         high, low: the matching intrabar extremes. **Required** — stops are checked against
             them and drawdown is measured against them.
-        **kwargs: see `PortfolioBacktest`.
+        **kwargs: see `PortfolioBacktest`, `windows=` among them (several windows of the
+            history, each its own account, in one call).
 
     Returns:
-        `vectorbtx.Portfolio`.
+        `vectorbtx.Portfolio`; with `windows=`, a list of them, one per window.
 
     Raises:
         BacktestError: if `price` has more than one column, or a portfolio-only argument

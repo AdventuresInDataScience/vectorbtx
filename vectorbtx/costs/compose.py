@@ -41,6 +41,7 @@ def resolve_costs(
     base_currency=None,
     fx_markup=None,
     point_fx=None,
+    first_bars=None,
 ) -> dict:
     """Compose every active cost module into `Order` keyword arguments.
 
@@ -60,6 +61,9 @@ def resolve_costs(
             were never converted, pay none). None falls back to `price.fx_markup`.
         point_fx: the rate each column's price was converted at, per bar, so a cost in
             points (the spread) is in the account currency. None: not converted.
+        first_bars: `{column: bar}`, where each column's history starts (a `windows=` call's
+            block, OpenStrategy Studio issue 42): automatic slippage measures from there.
+            None: from the first bar.
 
     Returns:
         `{"fees": ..., "fixed_fees": ..., "slippage": ...}`, each a scalar or a
@@ -98,6 +102,7 @@ def resolve_costs(
             notional=None if notional is None else _col_of(notional, col),
             rates=rates,
             point_fx=None if point_fx is None else _col_of(point_fx, col),
+            first_bar=int((first_bars or {}).get(col, 0)),
         )
 
         fee, fixed, slip = 0.0, 0.0, 0.0

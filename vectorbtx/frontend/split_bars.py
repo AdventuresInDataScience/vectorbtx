@@ -179,6 +179,25 @@ def can_split(sim_kwargs) -> bool:
     return True
 
 
+def _offsets_in_group(group_by, n_cols) -> np.ndarray:
+    """Each column's offset within its cash group, in column order: what a call sequence holds for a bar
+    that runs the columns in their own order. `group_by`: as vectorbt takes it (None or False: a group per
+    column; True: one group; labels, one per column, each group's columns side by side)."""
+    if group_by is None or group_by is False:
+        return np.zeros(n_cols, dtype=np.int64)
+    if group_by is True:
+        return np.arange(n_cols, dtype=np.int64)
+    labels = np.asarray(group_by)
+    if labels.ndim != 1 or len(labels) != n_cols:
+        # A level of the columns (vectorbt reads an int or a name as one): one group is the safe reading only
+        # when it is one; let vectorbt say otherwise.
+        return np.arange(n_cols, dtype=np.int64)
+    out = np.zeros(n_cols, dtype=np.int64)
+    for k in range(1, n_cols):
+        out[k] = out[k - 1] + 1 if labels[k] == labels[k - 1] else 0
+    return out
+
+
 def simulate_split_bars(cls, close, open, high, low, price, signals, call_seq=None, **kwargs):
     """Run `cls.from_signals` on the two-step index and map the result back.
 
@@ -235,7 +254,12 @@ def simulate_split_bars(cls, close, open, high, low, price, signals, call_seq=No
         split_signals[name] = two(on_open, np.zeros_like(on_open)).astype(bool)
 
     if isinstance(call_seq, np.ndarray) and call_seq.ndim == 2 and call_seq.shape[0] == n:
-        split_seq = np.tile(np.arange(call_seq.shape[1], dtype=np.int64), (2 * n, 1))
+        # The rest of the bar runs each cash group's columns in column order. ⚠️ A call sequence counts
+        # within each group (vectorbt's `call_seq[i, from_col:to_col]` is a permutation of the group's own
+        # offsets), so this is each column's offset in its group, not its column number: with several groups
+        # the column numbers ran past the first group's bounds and vectorbt raised "Call index exceeds bounds
+        # of the group" (found with `windows=`, OpenStrategy Studio issue 42).
+        split_seq = np.tile(_offsets_in_group(kwargs.get("group_by"), call_seq.shape[1]), (2 * n, 1))
         split_seq[0::2] = call_seq
         call_seq = split_seq
     if call_seq is not None:
